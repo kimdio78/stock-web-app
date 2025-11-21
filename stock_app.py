@@ -1,59 +1,65 @@
 import streamlit as st
-from pykrx import stock
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 import urllib3
+import FinanceDataReader as fdr # 안정적인 데이터 수집을 위한 라이브러리 교체
 import time
 
 # SSL 경고 무시
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- 데이터 수집 함수들 ---
-@st.cache_data(ttl=3600) # 1시간 캐싱
+@st.cache_data(ttl=3600)
 def load_stock_list():
-    # 최신 영업일 데이터를 찾기 위해 오늘부터 과거로 10일간 탐색
-    date = datetime.now()
-    for i in range(10): 
-        target_date = date.strftime("%Y%m%d")
-        try:
-            # 전체 종목의 시가총액 데이터를 한 번에 가져옴 (여기에 종목명이 포함됨) -> 속도 획기적 개선
-            df = stock.get_market_cap_by_ticker(target_date, market="ALL")
-            if not df.empty:
-                ticker_to_name = df['종목명'].to_dict()
-                name_to_ticker = {v: k for k, v in ticker_to_name.items()}
-                return ticker_to_name, name_to_ticker
-        except Exception:
-            pass # 에러 발생 시 하루 전으로 이동
-        date -= timedelta(days=1)
-        
-    return {}, {} # 실패 시 빈 딕셔너리 반환
+    # 1차 시도: FinanceDataReader (가장 안정적)
+    try:
+        df = fdr.StockListing('KRX')
+        if not df.empty:
+            ticker_to_name = dict(zip(df['Code'], df['Name']))
+            name_to_ticker = dict(zip(df['Name'], df['Code']))
+            return ticker_to_name, name_to_ticker
+    except:
+        pass
+    return {}, {}
 
-def get_ticker(query, ticker_to_name, name_to_ticker):
-    query = str(query).strip().upper()
-    # 입력값이 종목코드인 경우 (6자리 숫자)
-    if query.isdigit() and len(query) == 6:
-        if query in ticker_to_name:
-            return query
-    # 입력값이 종목명인 경우
-    elif query in name_to_ticker:
-        return name_to_ticker[query]
-    return None
-
-def get_company_overview_from_naver(ticker):
+def get_company_info_from_naver(ticker):
+    # 네이버 금융에서 개요, 시가총액, 현재가 등을 한 번에 긁어옴
     try:
         url = f"https://finance.naver.com/item/main.naver?code={ticker}"
         headers = {'User-Agent': 'Mozilla/5.0'}
         response = requests.get(url, headers=headers, verify=False, timeout=10)
+        
+        info = {'overview': "정보 없음", 'market_cap': 0, 'current_price': 0}
+        
         if response.status_code == 200:
             soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # 개요
             overview_div = soup.select_one("#summary_info")
             if overview_div:
-                return "\n ".join([p.text.strip() for p in overview_div.select("p") if p.text.strip()])
-        return "기업 개요 정보 없음"
+                info['overview'] = "\n ".join([p.text.strip() for p in overview_div.select("p") if p.text.strip()])
+            
+            # 시가총액 추출 (전일 시가총액 정보 활용)
+            try:
+                # 시가총액은 페이지 내 _market_sum 아이디 등에 있음
+                mc_element = soup.select_one("#_market_sum")
+                if mc_element:
+                    raw_mc = mc_element.text.strip().replace(',', '').replace('조', '').replace(' ', '')
+                    # 1조 2345억 -> 12345 (단위: 억원) 으로 변환 필요. 네이버는 '23조 4,123' 형태로 줌
+                    # 단, _market_sum 값은 '23조 4,123' 형태임.
+                    # 억 단위로 환산
+                    parts = raw_mc.split('조')
+                    trillion = int(parts[0]) if parts[0] else 0
+                    billion = int(parts[1]) if len(parts) > 1 and parts[1] else 0
+                    info['market_cap'] = (trillion * 10000 + billion) * 100000000 # 원 단위
+            except:
+                pass
+
+        return info
     except:
-        return "정보를 불러올 수 없습니다."
+        return {'overview': "로딩 실패", 'market_cap': 0}
 
 def get_financials_from_naver(ticker):
     try:
@@ -134,122 +140,117 @@ def main():
     st.title("📈 주식 적정주가 분석기")
 
     if 'ticker_to_name' not in st.session_state:
-        with st.spinner('종목 데이터 로딩 중... (최대 10초 소요)'):
+        with st.spinner('종목 데이터 로딩 중...'):
             st.session_state.ticker_to_name, st.session_state.name_to_ticker = load_stock_list()
     
     ticker_to_name = st.session_state.ticker_to_name
     name_to_ticker = st.session_state.name_to_ticker
 
-    # 데이터 로드 실패 시 재시도 버튼
-    if not ticker_to_name:
-        st.error("종목 정보를 불러오지 못했습니다.")
-        if st.button("다시 시도"):
-            st.cache_data.clear()
-            st.rerun()
-        return
-
+    # 사이드바
     with st.sidebar:
         st.header("설정")
         required_return = st.number_input("요구수익률 (%)", 1.0, 20.0, 8.0, 0.5)
 
-    stock_input = st.selectbox("종목 검색", [""] + list(name_to_ticker.keys()))
+    # --- 입력 방식 개선: 리스트가 비어있으면 직접 입력 창 활성화 ---
+    ticker = None
+    if ticker_to_name:
+        stock_input = st.selectbox("종목 검색", [""] + list(name_to_ticker.keys()))
+        if stock_input:
+            ticker = name_to_ticker.get(stock_input)
+    else:
+        st.warning("종목 목록 로딩 실패 (서버 연결 불안정). 종목코드를 직접 입력해주세요.")
+        ticker_input = st.text_input("종목코드 6자리 입력 (예: 005930)")
+        if ticker_input and len(ticker_input) == 6 and ticker_input.isdigit():
+            ticker = ticker_input
 
-    if stock_input:
-        ticker = get_ticker(stock_input, ticker_to_name, name_to_ticker)
-        if ticker:
-            try:
-                today = datetime.now().strftime("%Y%m%d")
-                start = (datetime.now() - timedelta(days=10)).strftime("%Y%m%d")
-                
-                df_price = stock.get_market_ohlcv_by_date(start, today, ticker)
-                if df_price.empty:
-                    st.error("거래 데이터를 가져올 수 없습니다.")
-                    return
-                
-                curr_price = df_price['종가'].iloc[-1]
-                
-                # 시가총액 정보가 없는 경우 예외처리
-                try:
-                    df_cap = stock.get_market_cap_by_date(start, today, ticker)
-                    market_cap = df_cap['시가총액'].iloc[-1]
-                except:
-                    market_cap = 0
+    if ticker:
+        try:
+            # FinanceDataReader를 사용해 주가 정보 가져오기 (안정적)
+            df_price = fdr.DataReader(ticker, datetime.now() - timedelta(days=7))
+            
+            if df_price.empty:
+                st.error(f"데이터를 찾을 수 없습니다. (코드: {ticker})")
+                return
+            
+            curr_price = df_price['Close'].iloc[-1] # 종가
+            
+            # 네이버 크롤링으로 추가 정보 수집
+            naver_info = get_company_info_from_naver(ticker)
+            annual, quarter = get_financials_from_naver(ticker)
+            
+            # 종목명 확인 (리스트에 없으면 코드로 표시)
+            display_name = ticker_to_name.get(ticker, ticker)
 
-                annual, quarter = get_financials_from_naver(ticker)
-                overview = get_company_overview_from_naver(ticker)
+            st.divider()
+            st.subheader(f"{display_name} ({ticker})")
+            
+            col1, col2 = st.columns(2)
+            col1.metric("현재가", f"{curr_price:,.0f} 원")
+            if naver_info['market_cap'] > 0:
+                col2.metric("시가총액", f"{naver_info['market_cap']/100000000:,.0f} 억원")
+
+            with st.expander("기업 개요"):
+                st.write(naver_info['overview'])
+
+            # 차트 링크
+            st.markdown(f"""
+                <a href="https://m.stock.naver.com/item/main.nhn?code={ticker}#/chart" target="_blank" style="text-decoration:none;">
+                    <div style="background-color:#03C75A; color:white; padding:12px; border-radius:8px; text-align:center; font-weight:bold; margin: 10px 0;">
+                        📊 네이버 증권 차트 보기
+                    </div>
+                </a>
+                """, unsafe_allow_html=True)
+            
+            # 차트 이미지 프리뷰
+            t_stamp = int(time.time())
+            st.image(f"https://ssl.pstatic.net/imgfinance/chart/item/candle/day/{ticker}.png?t={t_stamp}", use_container_width=True)
+
+            if annual:
+                st.markdown("### 📊 재무 요약")
+                disp_data = []
+                cols = ['항목'] + [d['date'] for d in annual] + ['최근분기']
+                items = [("매출(억)", 'revenue'), ("영업이익(억)", 'op_income'), ("ROE(%)", 'roe'), 
+                            ("부채비율(%)", 'debt_ratio'), ("BPS(원)", 'bps'), ("PER(배)", 'per'), ("PBR(배)", 'pbr')]
+                
+                for label, key in items:
+                    row = [label]
+                    for d in annual:
+                        val = d.get(key, 0)
+                        row.append(f"{val:,.0f}" if '원' in label or '억' in label else f"{val:,.2f}")
+                    q_val = quarter.get(key, 0)
+                    row.append(f"{q_val:,.0f}" if '원' in label or '억' in label else f"{q_val:,.2f}")
+                    disp_data.append(row)
+                
+                st.table(pd.DataFrame(disp_data, columns=cols))
 
                 st.divider()
-                st.subheader(f"{stock_input} ({ticker})")
-                col1, col2 = st.columns(2)
-                col1.metric("현재가", f"{curr_price:,.0f} 원")
-                if market_cap > 0:
-                    col2.metric("시가총액", f"{market_cap/100000000:,.0f} 억원")
-
-                with st.expander("기업 개요"):
-                    st.write(overview)
-
-                # --- 차트 이미지 표시 ---
-                st.subheader("📊 차트 보기")
-                t_stamp = int(time.time())
+                st.markdown("### 💰 S-RIM 적정주가")
                 
-                tab_d, tab_w, tab_m = st.tabs(["일봉", "주봉", "월봉"])
+                bps = annual[-1].get('bps', 0)
+                roes = [d.get('roe', 0) for d in annual if d.get('roe')]
+                avg_roe = sum(roes)/len(roes) if roes else 0
+                roe_1yr = annual[-1].get('roe', 0)
+
+                val_3yr = calculate_srim(bps, avg_roe, required_return)
+                val_1yr = calculate_srim(bps, roe_1yr, required_return)
+
+                tab1, tab2 = st.tabs(["📉 3년 평균 기준", "🆕 1년 실적 기준"])
                 
-                with tab_d:
-                    st.image(f"https://ssl.pstatic.net/imgfinance/chart/item/candle/day/{ticker}.png?t={t_stamp}", use_container_width=True)
-                with tab_w:
-                    st.image(f"https://ssl.pstatic.net/imgfinance/chart/item/candle/week/{ticker}.png?t={t_stamp}", use_container_width=True)
-                with tab_m:
-                    st.image(f"https://ssl.pstatic.net/imgfinance/chart/item/candle/month/{ticker}.png?t={t_stamp}", use_container_width=True)
-                
-                st.caption("출처: 네이버 금융")
-                # ----------------------------------------
+                def show_result(val, roe_used):
+                    st.metric("적정주가", f"{val:,.0f} 원")
+                    st.caption(f"적용 ROE: {roe_used:.2f}%")
+                    if val > 0:
+                        diff = (curr_price - val) / val * 100
+                        if val > curr_price:
+                            st.success(f"현재가({curr_price:,.0f}원)는 적정주가({val:,.0f}원) 대비 **{abs(diff):.1f}% 저평가** 상태입니다.")
+                        else:
+                            st.error(f"현재가({curr_price:,.0f}원)는 적정주가({val:,.0f}원) 대비 **{abs(diff):.1f}% 고평가** 상태입니다.")
 
-                if annual:
-                    st.markdown("### 📊 재무 요약")
-                    disp_data = []
-                    cols = ['항목'] + [d['date'] for d in annual] + ['최근분기']
-                    items = [("매출(억)", 'revenue'), ("영업이익(억)", 'op_income'), ("ROE(%)", 'roe'), 
-                             ("부채비율(%)", 'debt_ratio'), ("BPS(원)", 'bps'), ("PER(배)", 'per'), ("PBR(배)", 'pbr')]
-                    
-                    for label, key in items:
-                        row = [label]
-                        for d in annual:
-                            val = d.get(key, 0)
-                            row.append(f"{val:,.0f}" if '원' in label or '억' in label else f"{val:,.2f}")
-                        q_val = quarter.get(key, 0)
-                        row.append(f"{q_val:,.0f}" if '원' in label or '억' in label else f"{q_val:,.2f}")
-                        disp_data.append(row)
-                    
-                    st.table(pd.DataFrame(disp_data, columns=cols))
+                with tab1: show_result(val_3yr, avg_roe)
+                with tab2: show_result(val_1yr, roe_1yr)
 
-                    st.divider()
-                    st.markdown("### 💰 S-RIM 적정주가")
-                    
-                    bps = annual[-1].get('bps', 0)
-                    roes = [d.get('roe', 0) for d in annual if d.get('roe')]
-                    avg_roe = sum(roes)/len(roes) if roes else 0
-                    roe_1yr = annual[-1].get('roe', 0)
-
-                    val_3yr = calculate_srim(bps, avg_roe, required_return)
-                    val_1yr = calculate_srim(bps, roe_1yr, required_return)
-
-                    tab1, tab2 = st.tabs(["📉 3년 평균 기준", "🆕 1년 실적 기준"])
-                    
-                    def show_result(val, roe_used):
-                        st.metric("적정주가", f"{val:,.0f} 원")
-                        st.caption(f"적용 ROE: {roe_used:.2f}%")
-                        if val > 0:
-                            diff = (curr_price - val) / val * 100
-                            if val > curr_price:
-                                st.success(f"현재가({curr_price:,.0f}원)는 적정주가({val:,.0f}원) 대비 **{abs(diff):.1f}% 저평가** 상태입니다.")
-                            else:
-                                st.error(f"현재가({curr_price:,.0f}원)는 적정주가({val:,.0f}원) 대비 **{abs(diff):.1f}% 고평가** 상태입니다.")
-
-                    with tab1: show_result(val_3yr, avg_roe)
-                    with tab2: show_result(val_1yr, roe_1yr)
-
-            except Exception as e:
-                st.error(f"오류: {e}")
+        except Exception as e:
+            st.error(f"오류 발생: {e}")
 
 if __name__ == "__main__":
     main()
