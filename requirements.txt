@@ -1,6 +1,6 @@
 streamlit
-pykrx
+finance-datareader
 pandas
 requests
 beautifulsoup4
-setuptools
+lxml
