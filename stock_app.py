@@ -4,7 +4,7 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 import urllib3
-import FinanceDataReader as fdr # 안정적인 데이터 수집을 위한 라이브러리 교체
+import FinanceDataReader as fdr
 import time
 
 # SSL 경고 무시
@@ -13,8 +13,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # --- 데이터 수집 함수들 ---
 @st.cache_data(ttl=3600)
 def load_stock_list():
-    # 1차 시도: FinanceDataReader (가장 안정적)
     try:
+        # FinanceDataReader로 전체 종목 리스트 가져오기
         df = fdr.StockListing('KRX')
         if not df.empty:
             ticker_to_name = dict(zip(df['Code'], df['Name']))
@@ -25,41 +25,45 @@ def load_stock_list():
     return {}, {}
 
 def get_company_info_from_naver(ticker):
-    # 네이버 금융에서 개요, 시가총액, 현재가 등을 한 번에 긁어옴
+    """
+    네이버 금융에서 기업 개요, 시가총액, 그리고 **종목명**을 가져옵니다.
+    """
     try:
         url = f"https://finance.naver.com/item/main.naver?code={ticker}"
         headers = {'User-Agent': 'Mozilla/5.0'}
         response = requests.get(url, headers=headers, verify=False, timeout=10)
         
-        info = {'overview': "정보 없음", 'market_cap': 0, 'current_price': 0}
+        # 기본값 설정
+        info = {'name': ticker, 'overview': "정보 없음", 'market_cap': 0}
         
         if response.status_code == 200:
             soup = BeautifulSoup(response.text, 'html.parser')
             
-            # 개요
+            # 1. 종목명 추출 (h_company 클래스 내부)
+            name_tag = soup.select_one(".wrap_company h2 a")
+            if name_tag:
+                info['name'] = name_tag.text.strip()
+
+            # 2. 기업 개요 추출
             overview_div = soup.select_one("#summary_info")
             if overview_div:
                 info['overview'] = "\n ".join([p.text.strip() for p in overview_div.select("p") if p.text.strip()])
             
-            # 시가총액 추출 (전일 시가총액 정보 활용)
+            # 3. 시가총액 추출
             try:
-                # 시가총액은 페이지 내 _market_sum 아이디 등에 있음
                 mc_element = soup.select_one("#_market_sum")
                 if mc_element:
                     raw_mc = mc_element.text.strip().replace(',', '').replace('조', '').replace(' ', '')
-                    # 1조 2345억 -> 12345 (단위: 억원) 으로 변환 필요. 네이버는 '23조 4,123' 형태로 줌
-                    # 단, _market_sum 값은 '23조 4,123' 형태임.
-                    # 억 단위로 환산
                     parts = raw_mc.split('조')
                     trillion = int(parts[0]) if parts[0] else 0
                     billion = int(parts[1]) if len(parts) > 1 and parts[1] else 0
-                    info['market_cap'] = (trillion * 10000 + billion) * 100000000 # 원 단위
+                    info['market_cap'] = (trillion * 10000 + billion) * 100000000
             except:
                 pass
 
         return info
     except:
-        return {'overview': "로딩 실패", 'market_cap': 0}
+        return {'name': ticker, 'overview': "로딩 실패", 'market_cap': 0}
 
 def get_financials_from_naver(ticker):
     try:
@@ -151,35 +155,35 @@ def main():
         st.header("설정")
         required_return = st.number_input("요구수익률 (%)", 1.0, 20.0, 8.0, 0.5)
 
-    # --- 입력 방식 개선: 리스트가 비어있으면 직접 입력 창 활성화 ---
+    # --- 입력 방식: 리스트가 비어있으면 직접 입력 창 활성화 ---
     ticker = None
     if ticker_to_name:
         stock_input = st.selectbox("종목 검색", [""] + list(name_to_ticker.keys()))
         if stock_input:
             ticker = name_to_ticker.get(stock_input)
     else:
-        st.warning("종목 목록 로딩 실패 (서버 연결 불안정). 종목코드를 직접 입력해주세요.")
-        ticker_input = st.text_input("종목코드 6자리 입력 (예: 005930)")
+        st.warning("⚠️ 서버 연결 불안정으로 종목 목록을 불러오지 못했습니다. 아래에 종목코드를 직접 입력해주세요.")
+        ticker_input = st.text_input("종목코드 6자리 입력 (예: 005930)", max_chars=6)
         if ticker_input and len(ticker_input) == 6 and ticker_input.isdigit():
             ticker = ticker_input
 
     if ticker:
         try:
-            # FinanceDataReader를 사용해 주가 정보 가져오기 (안정적)
+            # 주가 정보 (FinanceDataReader)
             df_price = fdr.DataReader(ticker, datetime.now() - timedelta(days=7))
             
             if df_price.empty:
                 st.error(f"데이터를 찾을 수 없습니다. (코드: {ticker})")
                 return
             
-            curr_price = df_price['Close'].iloc[-1] # 종가
+            curr_price = df_price['Close'].iloc[-1]
             
-            # 네이버 크롤링으로 추가 정보 수집
+            # 네이버 크롤링으로 추가 정보 수집 (여기서 종목명을 가져옴)
             naver_info = get_company_info_from_naver(ticker)
             annual, quarter = get_financials_from_naver(ticker)
             
-            # 종목명 확인 (리스트에 없으면 코드로 표시)
-            display_name = ticker_to_name.get(ticker, ticker)
+            # 종목명 결정: 리스트에 있으면 리스트 사용, 없으면 크롤링 결과 사용
+            display_name = ticker_to_name.get(ticker, naver_info['name'])
 
             st.divider()
             st.subheader(f"{display_name} ({ticker})")
