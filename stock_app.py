@@ -126,7 +126,8 @@ def get_financials_from_naver(ticker):
             "EPS": "eps",
             "PER": "per",
             "BPS": "bps",
-            "PBR": "pbr"
+            "PBR": "pbr",
+            "이자보상배율": "interest_coverage_ratio"
         }
 
         for row in rows:
@@ -141,6 +142,10 @@ def get_financials_from_naver(ticker):
                     key = k_code
                     break
             
+            # 이자보상배율 별도 체크
+            if "이자보상배율" in th_clean:
+                key = "interest_coverage_ratio"
+
             if key:
                 cells = row.select("td")
                 for i, idx in enumerate(annual_indices):
@@ -264,6 +269,7 @@ def main():
                     ("당기순이익(억)", 'net_income'), 
                     ("순이익률(%)", 'net_income_margin'),
                     ("부채비율(%)", 'debt_ratio'), 
+                    ("이자보상배율(배)", 'interest_coverage_ratio'),
                     ("EPS(원)", 'eps'), 
                     ("BPS(원)", 'bps'), 
                     ("PER(배)", 'per'), 
@@ -292,7 +298,7 @@ def main():
                 
                 df_table = pd.DataFrame(disp_data, columns=cols)
                 
-                # --- 모바일 가독성을 위한 가로 스크롤 표 스타일 적용 (수정됨) ---
+                # --- CSS 수정: 배경색을 강제로 흰색/검은색으로 지정하여 겹침 방지 ---
                 st.markdown("""
                 <style>
                 .scroll-table {
@@ -306,36 +312,53 @@ def main():
                     font-size: 0.9rem;
                 }
                 .scroll-table th {
-                    background-color: rgba(128, 128, 128, 0.1);
                     text-align: center;
                     padding: 8px;
-                    border-bottom: 1px solid rgba(128, 128, 128, 0.2);
+                    border-bottom: 1px solid #ddd;
                     min-width: 80px;
+                    background-color: #f0f2f6; /* 라이트 모드 헤더 */
+                    color: #000;
                 }
                 .scroll-table td {
                     text-align: right;
                     padding: 8px;
-                    border-bottom: 1px solid rgba(128, 128, 128, 0.2);
+                    border-bottom: 1px solid #ddd;
                 }
-                /* 첫 번째 열 (항목 및 행 헤더) 고정 및 배경색 채움 */
+                
+                /* 첫 번째 열 고정 및 불투명 배경 설정 */
                 .scroll-table th:first-child, 
                 .scroll-table td:first-child {
                     position: sticky;
                     left: 0;
-                    z-index: 1;
-                    background-color: var(--background-color); /* 테마 배경색 적용 */
-                    border-right: 1px solid rgba(128, 128, 128, 0.2);
+                    z-index: 10;
+                    border-right: 2px solid #ccc; /* 경계선 강조 */
                     text-align: left;
                     font-weight: bold;
+                    background-color: #ffffff; /* 라이트 모드 기본 배경 (흰색) */
+                    color: #000000;
                 }
-                /* 헤더 셀 z-index 상향 */
-                .scroll-table th:first-child {
-                    z-index: 2;
+
+                /* 다크 모드 대응 (미디어 쿼리 사용) */
+                @media (prefers-color-scheme: dark) {
+                    .scroll-table th {
+                        background-color: #262730; /* 다크 모드 헤더 */
+                        color: #fff;
+                        border-bottom: 1px solid #444;
+                    }
+                    .scroll-table td {
+                        border-bottom: 1px solid #444;
+                        color: #fff; /* 다크 모드 글자색 */
+                    }
+                    .scroll-table th:first-child, 
+                    .scroll-table td:first-child {
+                        background-color: #0e1117; /* 다크 모드 배경 (검은색 계열) */
+                        color: #fff;
+                        border-right: 2px solid #555;
+                    }
                 }
                 </style>
                 """, unsafe_allow_html=True)
                 
-                # DataFrame을 HTML로 변환 후 렌더링
                 html = df_table.to_html(index=False, border=0, classes='scroll-table-content')
                 st.markdown(f'<div class="scroll-table">{html}</div>', unsafe_allow_html=True)
 
