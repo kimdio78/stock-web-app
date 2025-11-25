@@ -17,16 +17,13 @@ def load_stock_list():
     try:
         df = fdr.StockListing('KRX')
         if not df.empty:
-            # 검색 편의성을 위해 '종목명 (종목코드)' 형태의 리스트 생성
-            search_list = [f"{row['Name']} ({row['Code']})" for _, row in df.iterrows()]
-            # 검색용 맵핑 (검색어 -> 코드)
-            search_map = {f"{row['Name']} ({row['Code']})": row['Code'] for _, row in df.iterrows()}
-            # 표시용 맵핑 (코드 -> 이름)
-            ticker_to_name = {row['Code']: row['Name'] for _, row in df.iterrows()}
-            return search_list, search_map, ticker_to_name
+            df['Search_Key'] = df['Name'] + " (" + df['Code'] + ")"
+            search_map = dict(zip(df['Search_Key'], df['Code']))
+            ticker_to_name = dict(zip(df['Code'], df['Name']))
+            return search_map, ticker_to_name
     except:
         pass
-    return [], {}, {}
+    return {}, {}
 
 def get_company_info_from_naver(ticker):
     try:
@@ -61,17 +58,18 @@ def get_company_info_from_naver(ticker):
         return {'name': ticker, 'overview': "로딩 실패", 'market_cap': 0}
 
 def clean_float(text):
-    """문자열에서 숫자만 추출하여 float로 변환"""
-    if not text:
+    """문자열에서 숫자만 추출하여 float로 변환 (이자보상배율 오류 수정용)"""
+    if not text or text.strip() in ['-', 'N/A', '', '.']:
         return 0.0
     try:
         # 쉼표 제거
         text = text.replace(',', '')
-        # 정규표현식으로 숫자와 소수점, 마이너스 부호만 추출
+        # 숫자, 소수점, 마이너스 부호만 남김
         import re
-        matches = re.findall(r'-?\d+\.?\d*', text)
-        if matches:
-            return float(matches[0])
+        # 정규식: 음수 부호 가능, 숫자, 소수점 포함
+        match = re.search(r'-?\d+\.?\d*', text)
+        if match:
+            return float(match.group())
         return 0.0
     except:
         return 0.0
@@ -117,38 +115,65 @@ def get_financials_from_naver(ticker):
 
         rows = finance_table.select("tbody > tr")
         
-        # 재무 항목 매핑
-        items = {
-            "매출액": "revenue", "영업이익": "op_income", "당기순이익": "net_income",
-            "부채비율": "debt_ratio", 
-            "ROE(지배주주)": "roe", "EPS(원)": "eps", "PER(배)": "per", 
-            "BPS(원)": "bps", "PBR(배)": "pbr", 
-            "이자보상배율": "interest_coverage_ratio" 
+        # 사용자가 요청한 모든 항목 매핑 (네이버 페이지에 존재하는 것만 매칭됨)
+        # 공백을 제거하고 비교하여 매칭 정확도 향상
+        items_map = {
+            "매출액": "revenue",
+            "매출원가": "cost_of_sales",
+            "매출총이익": "gross_profit",
+            "판매비와관리비": "sga", # 띄어쓰기 제거 버전
+            "영업이익": "op_income",
+            "영업이익률": "op_margin", # 네이버 표기는 '영업이익률' 
+            "당기순이익": "net_income",
+            "당기순이익(지배)": "net_income_controlling",
+            "순이익률": "net_income_margin", # 네이버 표기 기준
+            "자산총계": "assets", # 네이버 표기는 자산총계
+            "부채총계": "liabilities",
+            "자본총계": "equity",
+            "자본총계(지배)": "equity_controlling",
+            "유동비율": "current_ratio",
+            "이자보상배율": "interest_coverage_ratio",
+            "부채비율": "debt_ratio",
+            "자기자본비율": "equity_ratio",
+            "EPS": "eps",
+            "SPS": "sps",
+            "BPS": "bps",
+            "주당배당금": "dps",
+            "배당성향": "payout_ratio",
+            "PER": "per",
+            "PSR": "psr",
+            "PBR": "pbr",
+            "EV/EBITDA": "ev_ebitda",
+            "ROE": "roe"
         }
 
         for row in rows:
             th_text = row.th.text.strip()
-            # 공백 제거 후 매칭 시도
-            th_clean = th_text.replace(" ", "")
+            # 텍스트 전처리: 줄바꿈 제거, 공백 제거 (매칭 확률 높임)
+            th_clean = th_text.replace("\n", "").replace(" ", "")
+            
             key = None
+            # 부분 일치 등으로 키 찾기
+            for k_text, k_code in items_map.items():
+                # 정확히 포함되는지 확인 (예: 'ROE' in 'ROE(지배주주)')
+                # 단, '영업이익'과 '영업이익률' 구분 필요
+                if k_text in th_clean:
+                    # 영업이익 vs 영업이익률 구분
+                    if k_text == "영업이익" and "률" in th_clean: continue
+                    if k_text == "당기순이익" and "률" in th_clean: continue
+                    
+                    key = k_code
+                    break
             
-            if "매출액" in th_clean: key = "revenue"
-            elif "영업이익" in th_clean and "률" not in th_clean: key = "op_income"
-            elif "당기순이익" in th_clean and "률" not in th_clean: key = "net_income"
-            elif "부채비율" in th_clean: key = "debt_ratio"
-            elif "ROE" in th_clean: key = "roe"
-            elif "EPS" in th_clean: key = "eps"
-            elif "PER" in th_clean: key = "per"
-            elif "BPS" in th_clean: key = "bps"
-            elif "PBR" in th_clean: key = "pbr"
-            elif "이자보상배율" in th_clean: key = "interest_coverage_ratio"
-            
+            # 이자보상배율 별도 체크 (확실하게)
+            if "이자보상배율" in th_clean:
+                key = "interest_coverage_ratio"
+
             if key:
                 cells = row.select("td")
                 for i, idx in enumerate(annual_indices):
                     t_idx = idx - cell_offset
                     if 0 <= t_idx < len(cells):
-                        # 텍스트 추출 및 정규식 기반 숫자 변환 (가장 확실한 방법)
                         val_text = cells[t_idx].text.strip()
                         annual_data[i][key] = clean_float(val_text)
                 
@@ -169,12 +194,11 @@ def calculate_srim(bps, roe, rrr):
     fair_value = bps + (bps * excess_profit_rate / (rrr / 100))
     return fair_value
 
-# --- 세션 상태 관리 및 콜백 ---
 if 'search_key' not in st.session_state:
-    st.session_state.search_key = 0  # 검색창 리셋을 위한 키
+    st.session_state.search_key = 0 
 
 def reset_search_state():
-    st.session_state.search_key += 1 # 키 값을 변경하여 리셋 효과
+    st.session_state.search_key += 1 
 
 # --- 메인 UI ---
 def main():
@@ -193,28 +217,24 @@ def main():
         st.header("설정")
         required_return = st.number_input("요구수익률 (%)", 1.0, 20.0, 8.0, 0.5)
 
-    # --- 1. 검색 기능 개선 (리셋 버튼 추가) ---
     st.markdown("##### 종목 검색")
-    
     col_search, col_reset = st.columns([4, 1])
     
     ticker = None
-    stock_input = None
-
     with col_search:
         if search_list:
-            # key를 session_state의 search_key로 지정하여, 버튼 클릭 시 강제 리셋 가능하게 함
             stock_input = st.selectbox(
                 "종목을 선택하거나 입력하세요", 
                 [""] + search_list,
                 index=0,
                 key=f"stock_selectbox_{st.session_state.search_key}",
-                label_visibility="collapsed"
+                label_visibility="collapsed",
+                placeholder="종목명 또는 코드를 입력하세요..."
             )
             if stock_input:
                 ticker = search_map.get(stock_input)
         else:
-            ticker_input = st.text_input("종목코드(6자리) 직접 입력", key="manual_input")
+            ticker_input = st.text_input("종목코드(6자리) 직접 입력")
             if ticker_input and len(ticker_input) == 6 and ticker_input.isdigit():
                 ticker = ticker_input
     
@@ -246,11 +266,10 @@ def main():
             with st.expander("기업 개요"):
                 st.write(naver_info['overview'])
 
-            # --- 2. 차트 링크 수정 (네이버 증권 '차트' 탭으로 직행) ---
             st.markdown(f"""
                 <a href="https://finance.naver.com/item/fchart.naver?code={ticker}" target="_blank" style="text-decoration:none;">
                     <div style="background-color:#03C75A; color:white; padding:12px; border-radius:8px; text-align:center; font-weight:bold; margin: 10px 0;">
-                        📊 네이버 증권 차트 새창으로 보기
+                        📊 네이버 증권 차트 보러가기
                     </div>
                 </a>
                 """, unsafe_allow_html=True)
@@ -266,23 +285,57 @@ def main():
                 disp_data = []
                 cols = ['항목'] + [d['date'] for d in annual] + ['최근분기']
                 
-                # 항목 리스트 (당좌비율, 유보율 삭제됨)
-                items = [
-                    ("매출액(억)", 'revenue'), ("영업이익(억)", 'op_income'), ("순이익(억)", 'net_income'),
-                    ("ROE(%)", 'roe'), ("부채비율(%)", 'debt_ratio'),
+                # --- 요청하신 순서대로 항목 배치 ---
+                # 참고: 네이버 메인 요약표에 없는 데이터는 0 또는 N/A로 나올 수 있습니다.
+                items_display = [
+                    ("매출액(억)", 'revenue'), 
+                    ("매출원가(억)", 'cost_of_sales'), 
+                    ("매출총이익(억)", 'gross_profit'),
+                    ("판매비와관리비(억)", 'sga'),
+                    ("영업이익(억)", 'op_income'), 
+                    ("영업이익률(%)", 'op_margin'),
+                    ("당기순이익(억)", 'net_income'), 
+                    ("당기순이익(지배)(억)", 'net_income_controlling'),
+                    ("당기순이익률(지배)(%)", 'net_income_margin'),
+                    ("자산총계(억)", 'assets'), 
+                    ("부채총계(억)", 'liabilities'), 
+                    ("자본총계(억)", 'equity'),
+                    ("자본총계(지배)(억)", 'equity_controlling'),
+                    ("유동비율(%)", 'current_ratio'),
                     ("이자보상배율(배)", 'interest_coverage_ratio'),
-                    ("EPS(원)", 'eps'), ("BPS(원)", 'bps'), ("PER(배)", 'per'), ("PBR(배)", 'pbr')
+                    ("부채비율(%)", 'debt_ratio'), 
+                    ("자기자본비율(%)", 'equity_ratio'),
+                    ("EPS(원)", 'eps'), 
+                    ("SPS(원)", 'sps'),
+                    ("BPS(원)", 'bps'), 
+                    ("주당배당금(원)", 'dps'),
+                    ("배당성향(%)", 'payout_ratio'),
+                    ("PER(배)", 'per'), 
+                    ("PSR(배)", 'psr'),
+                    ("PBR(배)", 'pbr'), 
+                    ("EV/EBITDA(배)", 'ev_ebitda'),
+                    ("ROE(%)", 'roe')
                 ]
                 
-                for label, key in items:
+                for label, key in items_display:
                     row = [label]
+                    # 데이터 포맷팅 (금액은 정수, 비율은 소수점)
+                    is_money = '원' in label or '억' in label
+                    
                     for d in annual:
                         val = d.get(key, 0)
-                        if '원' in label or '억' in label: row.append(f"{val:,.0f}")
-                        else: row.append(f"{val:,.2f}")
+                        # 데이터가 0이면 '-' 표시 (가독성 위해)
+                        if val == 0 and key not in ['op_income', 'net_income']: # 이익은 0일수도 있으므로 제외
+                            row.append("-")
+                        else:
+                            row.append(f"{val:,.0f}" if is_money else f"{val:,.2f}")
+                    
                     q_val = quarter.get(key, 0)
-                    if '원' in label or '억' in label: row.append(f"{q_val:,.0f}")
-                    else: row.append(f"{q_val:,.2f}")
+                    if q_val == 0 and key not in ['op_income', 'net_income']:
+                        row.append("-")
+                    else:
+                        row.append(f"{q_val:,.0f}" if is_money else f"{q_val:,.2f}")
+                        
                     disp_data.append(row)
                 
                 st.table(pd.DataFrame(disp_data, columns=cols))
@@ -292,12 +345,11 @@ def main():
                 
                 bps = annual[-1].get('bps', 0)
                 
-                # 3년 ROE 데이터 추출
                 roe_history = []
                 for d in annual:
                     if d.get('roe'):
                         roe_history.append({'연도': d['date'], 'ROE': d['roe']})
-                roe_history = roe_history[-3:] # 최근 3년치만 유지
+                roe_history = roe_history[-3:]
                 
                 avg_roe = sum([r['ROE'] for r in roe_history]) / len(roe_history) if roe_history else 0
                 roe_1yr = annual[-1].get('roe', 0)
@@ -305,7 +357,6 @@ def main():
                 val_3yr = calculate_srim(bps, avg_roe, required_return)
                 val_1yr = calculate_srim(bps, roe_1yr, required_return)
 
-                # 폰트 스타일
                 st.markdown("""
                 <style>
                 .calc-box {
