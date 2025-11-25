@@ -14,9 +14,10 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 @st.cache_data(ttl=3600)
 def load_stock_list():
     try:
+        # KRX 전체 종목 리스트 가져오기
         df = fdr.StockListing('KRX')
         if not df.empty:
-            # 검색 편의성을 위해 '종목명 (종목코드)' 형태의 키 생성
+            # 검색 키 생성: "삼성전자 (005930)"
             df['Search_Key'] = df['Name'] + " (" + df['Code'] + ")"
             search_map = dict(zip(df['Search_Key'], df['Code']))
             ticker_to_name = dict(zip(df['Code'], df['Name']))
@@ -137,7 +138,6 @@ def main():
     st.set_page_config(page_title="주식 적정주가 분석기", page_icon="📈")
     st.title("📈 주식 적정주가 분석기")
 
-    # 데이터 로드 (search_map과 ticker_to_name 분리 저장)
     if 'search_map' not in st.session_state:
         with st.spinner('종목 데이터 로딩 중...'):
             st.session_state.search_map, st.session_state.ticker_to_name = load_stock_list()
@@ -150,15 +150,25 @@ def main():
         required_return = st.number_input("요구수익률 (%)", 1.0, 20.0, 8.0, 0.5)
         st.info("보수적: 6~7% | 일반적: 8~9% | 공격적: 10%+")
 
+    # --- 1. 검색 방식 개선 (탭으로 분리) ---
+    search_tab1, search_tab2 = st.tabs(["🔍 종목명/코드로 검색", "🔢 코드 직접 입력"])
+    
     ticker = None
     
-    # --- 1. 검색창 개선: '삼성전자 (005930)' 형태로 표시하여 코드 검색 지원 ---
-    if search_map:
-        stock_input = st.selectbox("종목 검색 (이름 또는 코드)", [""] + list(search_map.keys()))
-        if stock_input:
-            ticker = search_map.get(stock_input)
-    else:
-        # 리스트 로딩 실패 시 비상용 입력창
+    with search_tab1:
+        if search_map:
+            # selectbox는 텍스트 검색(filtering)을 지원합니다.
+            stock_input = st.selectbox(
+                "종목을 선택하거나 검색하세요 (예: 삼성전자, 005930)", 
+                [""] + list(search_map.keys()),
+                index=0
+            )
+            if stock_input:
+                ticker = search_map.get(stock_input)
+        else:
+            st.warning("종목 목록을 불러오는 중입니다. 잠시 후 다시 시도하거나 '코드 직접 입력'을 이용하세요.")
+
+    with search_tab2:
         ticker_input = st.text_input("종목코드 6자리 입력 (예: 005930)", max_chars=6)
         if ticker_input and len(ticker_input) == 6 and ticker_input.isdigit():
             ticker = ticker_input
@@ -239,15 +249,9 @@ def main():
                 val_3yr = calculate_srim(bps, avg_roe, required_return)
                 val_1yr = calculate_srim(bps, roe_1yr, required_return)
 
-                tab1, tab2 = st.tabs(["📉 3년 실적 평균 기준", "🆕 최근 1년 실적 기준"])
-                
-                def show_detailed_result(val, roe_used, label_roe):
-                    # 결과 메트릭
-                    col_a, col_b = st.columns(2)
-                    col_a.metric("적정주가", f"{val:,.0f} 원")
-                    col_b.metric(f"적용 ROE ({label_roe})", f"{roe_used:.2f} %")
-                    
-                    # 판정 및 괴리율
+                # --- 결과 및 산출 근거 표시 함수 (디자인 개선) ---
+                def show_analysis_result(val, roe_used, label_roe):
+                    # 1. 결과 판정
                     if val > 0:
                         diff_rate = (curr_price - val) / val * 100
                         diff_abs = abs(diff_rate)
@@ -258,36 +262,46 @@ def main():
                     else:
                         st.warning("적정주가를 산출할 수 없습니다 (ROE가 너무 낮거나 데이터 부족).")
 
-                    # --- 2. 산출 근거를 표(Table) 형태로 개선 ---
-                    st.markdown("---")
-                    st.subheader("🧮 산출 근거")
+                    # 2. 산출 근거 시각화 (테이블 + 수식)
+                    st.markdown("#### 🧮 산출 근거")
                     
-                    # 입력 변수 표 생성
-                    input_df = pd.DataFrame({
-                        "구분": ["BPS (주당순자산)", f"ROE ({label_roe})", "요구수익률"],
+                    # 입력 변수 테이블
+                    st.markdown("**1. 입력 변수**")
+                    input_data = {
+                        "항목": ["BPS (주당순자산)", f"ROE ({label_roe})", "요구수익률"],
                         "값": [f"{bps:,.0f} 원", f"{roe_used:.2f} %", f"{required_return} %"],
-                        "설명": ["최근 결산 자본총계 / 주식수", "적용된 자기자본이익률", "투자자 기대 최소 수익률"]
-                    })
-                    st.table(input_df)
+                        "비고": ["최근 결산 자본총계 ÷ 주식수", "적용된 자기자본이익률", "투자자 기대 최소 수익률"]
+                    }
+                    st.table(pd.DataFrame(input_data))
 
-                    # 계산 과정 수식 표시
+                    # 계산 과정 수식
+                    st.markdown("**2. 계산 과정**")
                     excess_rate = roe_used - required_return
-                    st.markdown("**계산 과정**")
-                    st.info(f"""
-                    **1. 초과이익률** = {roe_used:.2f}% (ROE) - {required_return}% (요구수익률) = **{excess_rate:.2f}%**
                     
-                    **2. 적정주가 (S-RIM)** = BPS + (BPS × 초과이익률 / 요구수익률)  
-                    = {bps:,.0f} + ({bps:,.0f} × {excess_rate:.2f}% / {required_return}%)  
-                    = **{val:,.0f} 원**
-                    """)
+                    st.latex(r'''
+                    \text{초과이익률} = \text{ROE} - \text{요구수익률}
+                    ''')
+                    st.info(f"{roe_used:.2f}% - {required_return}% = **{excess_rate:.2f}%**")
 
+                    st.latex(r'''
+                    \text{적정주가} = \text{BPS} + \left( \text{BPS} \times \frac{\text{초과이익률}}{\text{요구수익률}} \right)
+                    ''')
+                    
+                    # 최종 계산식 보여주기
+                    calc_detail = f"{bps:,.0f} + ({bps:,.0f} \\times \\frac{{{excess_rate:.2f}\\%}}{{{required_return}\\%}})"
+                    st.latex(f"\\approx {calc_detail}")
+                    st.success(f"**= {val:,.0f} 원**")
+
+                # 탭 구성
+                tab1, tab2 = st.tabs(["📉 3년 실적 평균 기준", "🆕 최근 1년 실적 기준"])
+                
                 with tab1:
-                    st.write("최근 3년간의 평균 ROE를 적용하여 장기적인 기업 가치를 평가합니다.")
-                    show_detailed_result(val_3yr, avg_roe, "3년 평균")
+                    st.caption("최근 3년간의 평균 ROE를 적용하여 장기적인 기업 가치를 평가합니다.")
+                    show_analysis_result(val_3yr, avg_roe, "3년 평균")
                     
                 with tab2:
-                    st.write("가장 최근 결산 연도의 ROE를 적용하여 최신 실적 추세를 반영합니다.")
-                    show_detailed_result(val_1yr, roe_1yr, "최근 1년")
+                    st.caption("가장 최근 결산 연도의 ROE를 적용하여 최신 실적 추세를 반영합니다.")
+                    show_analysis_result(val_1yr, roe_1yr, "최근 1년")
 
         except Exception as e:
             st.error(f"오류 발생: {e}")
