@@ -7,7 +7,6 @@ import urllib3
 import FinanceDataReader as fdr
 import time
 import re
-import webbrowser
 
 # SSL 경고 무시
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -113,7 +112,6 @@ def get_financials_from_naver(ticker):
 
         rows = finance_table.select("tbody > tr")
         
-        # --- 수정된 항목 매핑 (데이터 없는 항목 제거) ---
         items_map = {
             "매출액": "revenue",
             "영업이익": "op_income",
@@ -137,10 +135,8 @@ def get_financials_from_naver(ticker):
             key = None
             for k_text, k_code in items_map.items():
                 if k_text in th_clean:
-                    # 영업이익 vs 영업이익률 구분
                     if k_text == "영업이익" and "률" in th_clean: continue
                     if k_text == "당기순이익" and "률" in th_clean: continue
-                    
                     key = k_code
                     break
             
@@ -260,7 +256,6 @@ def main():
                 disp_data = []
                 cols = ['항목'] + [d['date'] for d in annual] + ['최근분기']
                 
-                # --- 수정된 표시 항목 (데이터 있는 것만) ---
                 items_display = [
                     ("매출액(억)", 'revenue'), 
                     ("영업이익(억)", 'op_income'), 
@@ -268,8 +263,6 @@ def main():
                     ("당기순이익(억)", 'net_income'), 
                     ("순이익률(%)", 'net_income_margin'),
                     ("부채비율(%)", 'debt_ratio'), 
-                    ("당좌비율(%)", 'quick_ratio'), 
-                    ("유보율(%)", 'reserve_ratio'),
                     ("EPS(원)", 'eps'), 
                     ("BPS(원)", 'bps'), 
                     ("PER(배)", 'per'), 
@@ -315,6 +308,7 @@ def main():
                 val_3yr = calculate_srim(bps, avg_roe, required_return)
                 val_1yr = calculate_srim(bps, roe_1yr, required_return)
 
+                # --- 스타일 CSS 수정: 글자색 강제 설정 (모바일 다크모드 대응) ---
                 st.markdown("""
                 <style>
                 .calc-box {
@@ -323,10 +317,15 @@ def main():
                     padding: 15px;
                     margin-top: 10px;
                     font-family: sans-serif;
+                    color: #333333; /* 글자색을 짙은 회색으로 고정 */
                 }
                 .result-text {
                     font-size: 1.1em;
                     line-height: 1.6;
+                    color: #333333; /* 글자색 고정 */
+                }
+                .calc-box strong {
+                    color: #000000; /* 강조 텍스트는 완전 검정 */
                 }
                 </style>
                 """, unsafe_allow_html=True)
