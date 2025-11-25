@@ -308,28 +308,6 @@ def main():
                 val_3yr = calculate_srim(bps, avg_roe, required_return)
                 val_1yr = calculate_srim(bps, roe_1yr, required_return)
 
-                # --- 스타일 CSS 수정: 글자색 강제 설정 (모바일 다크모드 대응) ---
-                st.markdown("""
-                <style>
-                .calc-box {
-                    background-color: #f8f9fa;
-                    border-radius: 8px;
-                    padding: 15px;
-                    margin-top: 10px;
-                    font-family: sans-serif;
-                    color: #333333; /* 글자색을 짙은 회색으로 고정 */
-                }
-                .result-text {
-                    font-size: 1.1em;
-                    line-height: 1.6;
-                    color: #333333; /* 글자색 고정 */
-                }
-                .calc-box strong {
-                    color: #000000; /* 강조 텍스트는 완전 검정 */
-                }
-                </style>
-                """, unsafe_allow_html=True)
-
                 def show_analysis_result(val, roe_used, label_roe, roe_table_data=None):
                     if val > 0:
                         diff_rate = (curr_price - val) / val * 100
@@ -366,16 +344,14 @@ def main():
                     st.markdown("**3. 계산 과정**")
                     excess_rate = roe_used - required_return
                     
-                    st.markdown(f"""
-                    <div class="calc-box">
-                        <div class="result-text">
-                            <strong>① 초과이익률</strong> = ROE ({roe_used:.2f}%) - 요구수익률 ({required_return}%) = <strong>{excess_rate:.2f}%</strong><br><br>
-                            <strong>② 적정주가</strong> = BPS + ( BPS × 초과이익률 ÷ 요구수익률 )<br>
-                            &nbsp;&nbsp;&nbsp;&nbsp;= {bps:,.0f} + ( {bps:,.0f} × {excess_rate:.2f}% ÷ {required_return}% )<br>
-                            &nbsp;&nbsp;&nbsp;&nbsp;= <strong>{val:,.0f} 원</strong>
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
+                    # --- 수정된 부분: CSS 박스 대신 st.info 사용 (테마 자동 적용) ---
+                    with st.info("상세 계산 내역"):
+                        st.markdown(f"**① 초과이익률**")
+                        st.latex(rf" \text{{ROE}} ({roe_used:.2f}\%) - \text{{요구수익률}} ({required_return}\%) = \mathbf{{{excess_rate:.2f}\%}}")
+                        
+                        st.markdown(f"**② 적정주가 (S-RIM)**")
+                        st.latex(r" \text{BPS} + \left( \text{BPS} \times \frac{\text{초과이익률}}{\text{요구수익률}} \right) ")
+                        st.latex(rf" {bps:,.0f} + \left( {bps:,.0f} \times \frac{{{excess_rate:.2f}\%}}{{{required_return}\%}} \right) \approx \mathbf{{{val:,.0f} \text{{ 원}}}}")
 
                 tab1, tab2 = st.tabs(["📉 3년 실적 평균 기준", "🆕 최근 1년 실적 기준"])
                 
