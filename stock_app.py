@@ -7,6 +7,7 @@ import urllib3
 import FinanceDataReader as fdr
 import time
 import re
+import webbrowser
 
 # SSL 경고 무시
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -289,7 +290,46 @@ def main():
                         
                     disp_data.append(row)
                 
-                st.table(pd.DataFrame(disp_data, columns=cols))
+                df_table = pd.DataFrame(disp_data, columns=cols)
+                
+                # --- 모바일 가독성을 위한 가로 스크롤 표 스타일 적용 ---
+                st.markdown("""
+                <style>
+                .scroll-table {
+                    overflow-x: auto;
+                    white-space: nowrap;
+                    margin-bottom: 10px;
+                }
+                .scroll-table table {
+                    width: 100%;
+                    border-collapse: collapse;
+                    font-size: 0.9rem;
+                }
+                /* 다크모드/라이트모드 자동 대응을 위해 색상은 최대한 상속 또는 반투명 사용 */
+                .scroll-table th {
+                    background-color: rgba(128, 128, 128, 0.1);
+                    text-align: center;
+                    padding: 8px;
+                    border-bottom: 1px solid rgba(128, 128, 128, 0.2);
+                }
+                .scroll-table td {
+                    text-align: right;
+                    padding: 8px;
+                    border-bottom: 1px solid rgba(128, 128, 128, 0.2);
+                }
+                .scroll-table td:first-child {
+                    text-align: left;
+                    font-weight: bold;
+                    position: sticky; /* 모바일 가독성 위해 첫 열 고정 시도 */
+                    left: 0;
+                    background-color: inherit; /* 배경색 상속 */
+                }
+                </style>
+                """, unsafe_allow_html=True)
+                
+                # DataFrame을 HTML로 변환 후 렌더링
+                html = df_table.to_html(index=False, border=0, classes='scroll-table-content')
+                st.markdown(f'<div class="scroll-table">{html}</div>', unsafe_allow_html=True)
 
                 st.divider()
                 st.markdown("### 💰 S-RIM 적정주가 분석")
@@ -329,6 +369,8 @@ def main():
                             "구분": ["BPS (주당순자산)", f"적용 ROE ({label_roe})"],
                             "값": [f"{bps:,.0f} 원", f"{roe_used:.2f} %"]
                         })
+                        # 기본 st.table은 모바일에서 잘릴 수 있으므로 간단한 정보는 그대로 유지하되, 
+                        # 필요시 HTML 변환 방식을 사용할 수 있음. 여기선 데이터가 짧아 st.table 유지.
                         st.table(input_df)
                     
                     with col_input2:
