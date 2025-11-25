@@ -292,7 +292,7 @@ def main():
                 
                 df_table = pd.DataFrame(disp_data, columns=cols)
                 
-                # --- 모바일 가독성을 위한 가로 스크롤 표 스타일 적용 ---
+                # --- 모바일 가독성을 위한 가로 스크롤 표 스타일 적용 (수정됨) ---
                 st.markdown("""
                 <style>
                 .scroll-table {
@@ -305,24 +305,32 @@ def main():
                     border-collapse: collapse;
                     font-size: 0.9rem;
                 }
-                /* 다크모드/라이트모드 자동 대응을 위해 색상은 최대한 상속 또는 반투명 사용 */
                 .scroll-table th {
                     background-color: rgba(128, 128, 128, 0.1);
                     text-align: center;
                     padding: 8px;
                     border-bottom: 1px solid rgba(128, 128, 128, 0.2);
+                    min-width: 80px;
                 }
                 .scroll-table td {
                     text-align: right;
                     padding: 8px;
                     border-bottom: 1px solid rgba(128, 128, 128, 0.2);
                 }
+                /* 첫 번째 열 (항목 및 행 헤더) 고정 및 배경색 채움 */
+                .scroll-table th:first-child, 
                 .scroll-table td:first-child {
+                    position: sticky;
+                    left: 0;
+                    z-index: 1;
+                    background-color: var(--background-color); /* 테마 배경색 적용 */
+                    border-right: 1px solid rgba(128, 128, 128, 0.2);
                     text-align: left;
                     font-weight: bold;
-                    position: sticky; /* 모바일 가독성 위해 첫 열 고정 시도 */
-                    left: 0;
-                    background-color: inherit; /* 배경색 상속 */
+                }
+                /* 헤더 셀 z-index 상향 */
+                .scroll-table th:first-child {
+                    z-index: 2;
                 }
                 </style>
                 """, unsafe_allow_html=True)
@@ -369,8 +377,6 @@ def main():
                             "구분": ["BPS (주당순자산)", f"적용 ROE ({label_roe})"],
                             "값": [f"{bps:,.0f} 원", f"{roe_used:.2f} %"]
                         })
-                        # 기본 st.table은 모바일에서 잘릴 수 있으므로 간단한 정보는 그대로 유지하되, 
-                        # 필요시 HTML 변환 방식을 사용할 수 있음. 여기선 데이터가 짧아 st.table 유지.
                         st.table(input_df)
                     
                     with col_input2:
@@ -386,7 +392,6 @@ def main():
                     st.markdown("**3. 계산 과정**")
                     excess_rate = roe_used - required_return
                     
-                    # --- 수정된 부분: CSS 박스 대신 st.info 사용 (테마 자동 적용) ---
                     with st.info("상세 계산 내역"):
                         st.markdown(f"**① 초과이익률**")
                         st.latex(rf" \text{{ROE}} ({roe_used:.2f}\%) - \text{{요구수익률}} ({required_return}\%) = \mathbf{{{excess_rate:.2f}\%}}")
