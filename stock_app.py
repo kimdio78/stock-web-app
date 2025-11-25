@@ -20,10 +20,11 @@ def load_stock_list():
             df['Search_Key'] = df['Name'] + " (" + df['Code'] + ")"
             search_map = dict(zip(df['Search_Key'], df['Code']))
             ticker_to_name = dict(zip(df['Code'], df['Name']))
-            return search_map, ticker_to_name
+            search_list = list(search_map.keys())
+            return search_list, search_map, ticker_to_name
     except:
         pass
-    return {}, {}
+    return [], {}, {}
 
 def get_company_info_from_naver(ticker):
     try:
