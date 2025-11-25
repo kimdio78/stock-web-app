@@ -16,9 +16,11 @@ def load_stock_list():
     try:
         df = fdr.StockListing('KRX')
         if not df.empty:
+            # 검색 편의성을 위해 '종목명 (종목코드)' 형태의 키 생성
+            df['Search_Key'] = df['Name'] + " (" + df['Code'] + ")"
+            search_map = dict(zip(df['Search_Key'], df['Code']))
             ticker_to_name = dict(zip(df['Code'], df['Name']))
-            name_to_ticker = dict(zip(df['Name'], df['Code']))
-            return ticker_to_name, name_to_ticker
+            return search_map, ticker_to_name
     except:
         pass
     return {}, {}
@@ -95,7 +97,6 @@ def get_financials_from_naver(ticker):
         quarter_data = {'date': date_columns[quarter_idx].split('(')[0]} if quarter_idx != -1 else {}
 
         rows = finance_table.select("tbody > tr")
-        # --- 추가된 재무 지표 (이자보상배율, 유보율 등) ---
         items = {
             "매출액": "revenue", "영업이익": "op_income", "당기순이익": "net_income",
             "부채비율": "debt_ratio", "당좌비율": "quick_ratio", "유보율": "reserve_ratio",
@@ -136,12 +137,13 @@ def main():
     st.set_page_config(page_title="주식 적정주가 분석기", page_icon="📈")
     st.title("📈 주식 적정주가 분석기")
 
-    if 'ticker_to_name' not in st.session_state:
+    # 데이터 로드 (search_map과 ticker_to_name 분리 저장)
+    if 'search_map' not in st.session_state:
         with st.spinner('종목 데이터 로딩 중...'):
-            st.session_state.ticker_to_name, st.session_state.name_to_ticker = load_stock_list()
+            st.session_state.search_map, st.session_state.ticker_to_name = load_stock_list()
     
+    search_map = st.session_state.search_map
     ticker_to_name = st.session_state.ticker_to_name
-    name_to_ticker = st.session_state.name_to_ticker
 
     with st.sidebar:
         st.header("설정")
@@ -149,11 +151,14 @@ def main():
         st.info("보수적: 6~7% | 일반적: 8~9% | 공격적: 10%+")
 
     ticker = None
-    if ticker_to_name:
-        stock_input = st.selectbox("종목 검색", [""] + list(name_to_ticker.keys()))
+    
+    # --- 1. 검색창 개선: '삼성전자 (005930)' 형태로 표시하여 코드 검색 지원 ---
+    if search_map:
+        stock_input = st.selectbox("종목 검색 (이름 또는 코드)", [""] + list(search_map.keys()))
         if stock_input:
-            ticker = name_to_ticker.get(stock_input)
+            ticker = search_map.get(stock_input)
     else:
+        # 리스트 로딩 실패 시 비상용 입력창
         ticker_input = st.text_input("종목코드 6자리 입력 (예: 005930)", max_chars=6)
         if ticker_input and len(ticker_input) == 6 and ticker_input.isdigit():
             ticker = ticker_input
@@ -196,10 +201,9 @@ def main():
             with tab_m: st.image(f"https://ssl.pstatic.net/imgfinance/chart/item/candle/month/{ticker}.png?t={t_stamp}", use_container_width=True)
 
             if annual:
-                st.markdown("### 📊 재무 요약 (확장)")
+                st.markdown("### 📊 재무 요약")
                 disp_data = []
                 cols = ['항목'] + [d['date'] for d in annual] + ['최근분기']
-                # --- 추가된 지표 포함 ---
                 items = [
                     ("매출액(억)", 'revenue'), ("영업이익(억)", 'op_income'), ("순이익(억)", 'net_income'),
                     ("ROE(%)", 'roe'), ("부채비율(%)", 'debt_ratio'), ("당좌비율(%)", 'quick_ratio'), ("유보율(%)", 'reserve_ratio'),
@@ -211,7 +215,6 @@ def main():
                     row = [label]
                     for d in annual:
                         val = d.get(key, 0)
-                        # 소수점 처리 로직
                         if '원' in label or '억' in label:
                             row.append(f"{val:,.0f}")
                         else:
@@ -255,24 +258,27 @@ def main():
                     else:
                         st.warning("적정주가를 산출할 수 없습니다 (ROE가 너무 낮거나 데이터 부족).")
 
-                    # 산출 근거 상세 표시
+                    # --- 2. 산출 근거를 표(Table) 형태로 개선 ---
                     st.markdown("---")
-                    st.markdown("#### 🧮 산출 근거 (Calculation)")
-                    st.code(f"""
-# 1. 입력 변수
-BPS (최근 결산 기준 주당순자산) : {bps:,.0f} 원
-ROE (적용된 자기자본이익률)     : {roe_used:.2f} % ({label_roe})
-RRR (요구수익률)                : {required_return} %
+                    st.subheader("🧮 산출 근거")
+                    
+                    # 입력 변수 표 생성
+                    input_df = pd.DataFrame({
+                        "구분": ["BPS (주당순자산)", f"ROE ({label_roe})", "요구수익률"],
+                        "값": [f"{bps:,.0f} 원", f"{roe_used:.2f} %", f"{required_return} %"],
+                        "설명": ["최근 결산 자본총계 / 주식수", "적용된 자기자본이익률", "투자자 기대 최소 수익률"]
+                    })
+                    st.table(input_df)
 
-# 2. 초과이익률 계산 (Excess Return)
-초과이익률 = ROE - 요구수익률
-           = {roe_used:.2f}% - {required_return}% = {roe_used - required_return:.2f}%
-
-# 3. 적정주가 계산 (S-RIM 공식)
-적정주가 = BPS + (BPS × 초과이익률 / 요구수익률)
-         = {bps:,.0f} + ({bps:,.0f} × {roe_used - required_return:.2f}% / {required_return}%)
-         = {bps:,.0f} + {bps * (roe_used - required_return) / required_return :,.0f}
-         = {val:,.0f} 원
+                    # 계산 과정 수식 표시
+                    excess_rate = roe_used - required_return
+                    st.markdown("**계산 과정**")
+                    st.info(f"""
+                    **1. 초과이익률** = {roe_used:.2f}% (ROE) - {required_return}% (요구수익률) = **{excess_rate:.2f}%**
+                    
+                    **2. 적정주가 (S-RIM)** = BPS + (BPS × 초과이익률 / 요구수익률)  
+                    = {bps:,.0f} + ({bps:,.0f} × {excess_rate:.2f}% / {required_return}%)  
+                    = **{val:,.0f} 원**
                     """)
 
                 with tab1:
