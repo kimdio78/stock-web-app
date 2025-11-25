@@ -13,7 +13,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- 데이터 수집 함수들 ---
 @st.cache_data(ttl=3600)
-def load_stock_list():
+def load_stock_data(): # 함수 이름 변경 (캐시 충돌 방지)
     try:
         df = fdr.StockListing('KRX')
         if not df.empty:
@@ -208,7 +208,8 @@ def main():
 
     if 'search_list' not in st.session_state:
         with st.spinner('종목 데이터 로딩 중...'):
-            st.session_state.search_list, st.session_state.search_map, st.session_state.ticker_to_name = load_stock_list()
+            # 함수명 변경: load_stock_list -> load_stock_data
+            st.session_state.search_list, st.session_state.search_map, st.session_state.ticker_to_name = load_stock_data()
     
     search_list = st.session_state.search_list
     search_map = st.session_state.search_map
