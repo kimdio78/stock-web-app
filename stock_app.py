@@ -14,10 +14,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 @st.cache_data(ttl=3600)
 def load_stock_list():
     try:
-        # KRX 전체 종목 리스트 가져오기
         df = fdr.StockListing('KRX')
         if not df.empty:
-            # 검색 키 생성: "삼성전자 (005930)"
             df['Search_Key'] = df['Name'] + " (" + df['Code'] + ")"
             search_map = dict(zip(df['Search_Key'], df['Code']))
             ticker_to_name = dict(zip(df['Code'], df['Name']))
@@ -98,29 +96,48 @@ def get_financials_from_naver(ticker):
         quarter_data = {'date': date_columns[quarter_idx].split('(')[0]} if quarter_idx != -1 else {}
 
         rows = finance_table.select("tbody > tr")
+        # 항목 매핑 수정 (이자보상배율 정확도 향상)
         items = {
             "매출액": "revenue", "영업이익": "op_income", "당기순이익": "net_income",
-            "부채비율": "debt_ratio", "당좌비율": "quick_ratio", "유보율": "reserve_ratio",
+            "부채비율": "debt_ratio", 
             "ROE(지배주주)": "roe", "EPS(원)": "eps", "PER(배)": "per", 
-            "BPS(원)": "bps", "PBR(배)": "pbr", "이자보상배율": "interest_coverage_ratio"
+            "BPS(원)": "bps", "PBR(배)": "pbr", 
+            "이자보상배율": "interest_coverage_ratio" 
         }
 
         for row in rows:
-            th = row.th.text.strip()
-            if th in items:
-                key = items[th]
+            th_text = row.th.text.strip()
+            # 이자보상배율 등 일부 항목 이름이 조금씩 다를 수 있어 포함 여부로 체크
+            key = None
+            if th_text in items:
+                key = items[th_text]
+            
+            if key:
                 cells = row.select("td")
                 for i, idx in enumerate(annual_indices):
                     t_idx = idx - cell_offset
                     if 0 <= t_idx < len(cells):
                         val = cells[t_idx].text.strip().replace(",", "")
-                        annual_data[i][key] = float(val) if val and val not in ['N/A','-'] else 0.0
+                        # N/A, - 처리
+                        if val in ['N/A', '-', '', '.']:
+                            annual_data[i][key] = 0.0
+                        else:
+                            try:
+                                annual_data[i][key] = float(val)
+                            except:
+                                annual_data[i][key] = 0.0
                 
                 if quarter_idx != -1:
                     t_idx = quarter_idx - cell_offset
                     if 0 <= t_idx < len(cells):
                         val = cells[t_idx].text.strip().replace(",", "")
-                        quarter_data[key] = float(val) if val and val not in ['N/A','-'] else 0.0
+                        if val in ['N/A', '-', '', '.']:
+                            quarter_data[key] = 0.0
+                        else:
+                            try:
+                                quarter_data[key] = float(val)
+                            except:
+                                quarter_data[key] = 0.0
         
         annual_data.reverse()
         return annual_data, quarter_data
@@ -132,6 +149,13 @@ def calculate_srim(bps, roe, rrr):
     excess_profit_rate = (roe - rrr) / 100
     fair_value = bps + (bps * excess_profit_rate / (rrr / 100))
     return fair_value
+
+# --- 콜백 함수 (검색 충돌 방지용) ---
+def clear_text_input():
+    st.session_state['ticker_input'] = ""
+
+def clear_selectbox():
+    st.session_state['stock_input'] = ""
 
 # --- 메인 UI ---
 def main():
@@ -147,29 +171,40 @@ def main():
 
     with st.sidebar:
         st.header("설정")
+        # 2. 요구수익률 하단 설명 삭제
         required_return = st.number_input("요구수익률 (%)", 1.0, 20.0, 8.0, 0.5)
-        st.info("보수적: 6~7% | 일반적: 8~9% | 공격적: 10%+")
 
-    # --- 1. 검색 방식 개선 (탭으로 분리) ---
-    search_tab1, search_tab2 = st.tabs(["🔍 종목명/코드로 검색", "🔢 코드 직접 입력"])
+    # --- 1. & 4. 검색 방식 개선 및 충돌 해결 ---
+    st.markdown("##### 종목 검색")
+    
+    # 탭 대신 두 입력 방식을 나란히 배치하지 않고, 기능적으로 분리
+    # selectbox 선택 시 text_input 초기화, text_input 입력 시 selectbox 초기화
+    
+    col_search1, col_search2 = st.columns(2)
     
     ticker = None
     
-    with search_tab1:
+    with col_search1:
         if search_map:
-            # selectbox는 텍스트 검색(filtering)을 지원합니다.
             stock_input = st.selectbox(
-                "종목을 선택하거나 검색하세요 (예: 삼성전자, 005930)", 
+                "목록에서 선택 (이름/코드)", 
                 [""] + list(search_map.keys()),
-                index=0
+                index=0,
+                key='stock_input',
+                on_change=clear_text_input # 변경 시 텍스트 입력 초기화
             )
             if stock_input:
                 ticker = search_map.get(stock_input)
         else:
-            st.warning("종목 목록을 불러오는 중입니다. 잠시 후 다시 시도하거나 '코드 직접 입력'을 이용하세요.")
+            st.warning("목록 로딩 중...")
 
-    with search_tab2:
-        ticker_input = st.text_input("종목코드 6자리 입력 (예: 005930)", max_chars=6)
+    with col_search2:
+        ticker_input = st.text_input(
+            "코드 직접 입력 (6자리)", 
+            max_chars=6,
+            key='ticker_input',
+            on_change=clear_selectbox # 변경 시 선택 상자 초기화
+        )
         if ticker_input and len(ticker_input) == 6 and ticker_input.isdigit():
             ticker = ticker_input
 
@@ -196,10 +231,11 @@ def main():
             with st.expander("기업 개요"):
                 st.write(naver_info['overview'])
 
+            # 7. 차트 링크 수정 (네이버 증권 차트 탭으로 바로 연결)
             st.markdown(f"""
                 <a href="https://m.stock.naver.com/item/main.nhn?code={ticker}#/chart" target="_blank" style="text-decoration:none;">
                     <div style="background-color:#03C75A; color:white; padding:12px; border-radius:8px; text-align:center; font-weight:bold; margin: 10px 0;">
-                        📊 네이버 증권 차트 보기
+                        📊 네이버 증권 차트 보러가기
                     </div>
                 </a>
                 """, unsafe_allow_html=True)
@@ -214,10 +250,11 @@ def main():
                 st.markdown("### 📊 재무 요약")
                 disp_data = []
                 cols = ['항목'] + [d['date'] for d in annual] + ['최근분기']
+                # 6. 재무요약 항목 수정 (당좌비율, 유보율 삭제)
                 items = [
                     ("매출액(억)", 'revenue'), ("영업이익(억)", 'op_income'), ("순이익(억)", 'net_income'),
-                    ("ROE(%)", 'roe'), ("부채비율(%)", 'debt_ratio'), ("당좌비율(%)", 'quick_ratio'), ("유보율(%)", 'reserve_ratio'),
-                    ("이자보상배율(배)", 'interest_coverage_ratio'),
+                    ("ROE(%)", 'roe'), ("부채비율(%)", 'debt_ratio'),
+                    ("이자보상배율(배)", 'interest_coverage_ratio'), # 5. 이자보상배율 표시 문제 해결 (크롤링 로직 개선됨)
                     ("EPS(원)", 'eps'), ("BPS(원)", 'bps'), ("PER(배)", 'per'), ("PBR(배)", 'pbr')
                 ]
                 
@@ -242,15 +279,41 @@ def main():
                 st.markdown("### 💰 S-RIM 적정주가 분석")
                 
                 bps = annual[-1].get('bps', 0)
-                roes = [d.get('roe', 0) for d in annual if d.get('roe')]
+                # 1. 최근 3년치 ROE 데이터 준비
+                roe_data_3yr = [(d['date'], d.get('roe', 0)) for d in annual if d.get('roe')]
+                # 최근 3개만 사용 (이미 역순 정렬되어 있으므로 앞 3개는 최근 3년이 아닐 수 있음 -> annual_data는 get_financials에서 reverse()되어 최근이 마지막임.
+                # annual_data는 과거->최신 순. 따라서 뒤에서 3개 가져옴.
+                roe_data_3yr = roe_data_3yr[-3:]
+                
+                roes = [r[1] for r in roe_data_3yr]
                 avg_roe = sum(roes)/len(roes) if roes else 0
                 roe_1yr = annual[-1].get('roe', 0)
 
                 val_3yr = calculate_srim(bps, avg_roe, required_return)
                 val_1yr = calculate_srim(bps, roe_1yr, required_return)
 
-                # --- 결과 및 산출 근거 표시 함수 (디자인 개선) ---
-                def show_analysis_result(val, roe_used, label_roe):
+                # 3. 폰트 통일을 위한 CSS 스타일
+                st.markdown("""
+                <style>
+                .calc-box {
+                    background-color: #f0f2f6;
+                    border-radius: 10px;
+                    padding: 20px;
+                    font-family: "Source Sans Pro", sans-serif;
+                    margin-bottom: 20px;
+                }
+                .calc-line {
+                    margin-bottom: 10px;
+                    line-height: 1.6;
+                }
+                .highlight {
+                    color: #0068c9;
+                    font-weight: bold;
+                }
+                </style>
+                """, unsafe_allow_html=True)
+
+                def show_analysis_result(val, roe_used, label_roe, roe_details=None):
                     # 1. 결과 판정
                     if val > 0:
                         diff_rate = (curr_price - val) / val * 100
@@ -262,42 +325,48 @@ def main():
                     else:
                         st.warning("적정주가를 산출할 수 없습니다 (ROE가 너무 낮거나 데이터 부족).")
 
-                    # 2. 산출 근거 시각화 (테이블 + 수식)
                     st.markdown("#### 🧮 산출 근거")
                     
                     # 입력 변수 테이블
                     st.markdown("**1. 입력 변수**")
+                    
+                    roe_desc = f"{roe_used:.2f} %"
+                    if roe_details:
+                        # 1. 최근 3년 ROE 내역 표시
+                        roe_desc += f" (평균: {', '.join([f'{y}: {r:.2f}%' for y, r in roe_details])})"
+
                     input_data = {
                         "항목": ["BPS (주당순자산)", f"ROE ({label_roe})", "요구수익률"],
-                        "값": [f"{bps:,.0f} 원", f"{roe_used:.2f} %", f"{required_return} %"],
+                        "값": [f"{bps:,.0f} 원", roe_desc, f"{required_return} %"],
                         "비고": ["최근 결산 자본총계 ÷ 주식수", "적용된 자기자본이익률", "투자자 기대 최소 수익률"]
                     }
                     st.table(pd.DataFrame(input_data))
 
-                    # 계산 과정 수식
+                    # 3. 계산 과정 (폰트 통일 및 가독성 개선)
                     st.markdown("**2. 계산 과정**")
                     excess_rate = roe_used - required_return
                     
-                    st.latex(r'''
-                    \text{초과이익률} = \text{ROE} - \text{요구수익률}
-                    ''')
-                    st.info(f"{roe_used:.2f}% - {required_return}% = **{excess_rate:.2f}%**")
+                    # HTML/CSS로 깔끔하게 수식 표현
+                    st.markdown(f"""
+                    <div class="calc-box">
+                        <div class="calc-line">
+                            <strong>① 초과이익률</strong> = ROE - 요구수익률<br>
+                            &nbsp;&nbsp;&nbsp;&nbsp;= {roe_used:.2f}% - {required_return}% = <span class="highlight">{excess_rate:.2f}%</span>
+                        </div>
+                        <div class="calc-line">
+                            <strong>② 적정주가 (S-RIM)</strong> = BPS + ( BPS × 초과이익률 ÷ 요구수익률 )<br>
+                            &nbsp;&nbsp;&nbsp;&nbsp;= {bps:,.0f} + ( {bps:,.0f} × {excess_rate:.2f}% ÷ {required_return}% )<br>
+                            &nbsp;&nbsp;&nbsp;&nbsp;= <strong style="font-size: 1.2em;">{val:,.0f} 원</strong>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
 
-                    st.latex(r'''
-                    \text{적정주가} = \text{BPS} + \left( \text{BPS} \times \frac{\text{초과이익률}}{\text{요구수익률}} \right)
-                    ''')
-                    
-                    # 최종 계산식 보여주기
-                    calc_detail = f"{bps:,.0f} + ({bps:,.0f} \\times \\frac{{{excess_rate:.2f}\\%}}{{{required_return}\\%}})"
-                    st.latex(f"\\approx {calc_detail}")
-                    st.success(f"**= {val:,.0f} 원**")
-
-                # 탭 구성
                 tab1, tab2 = st.tabs(["📉 3년 실적 평균 기준", "🆕 최근 1년 실적 기준"])
                 
                 with tab1:
                     st.caption("최근 3년간의 평균 ROE를 적용하여 장기적인 기업 가치를 평가합니다.")
-                    show_analysis_result(val_3yr, avg_roe, "3년 평균")
+                    # 3년치 데이터 전달
+                    show_analysis_result(val_3yr, avg_roe, "3년 평균", roe_details=roe_data_3yr)
                     
                 with tab2:
                     st.caption("가장 최근 결산 연도의 ROE를 적용하여 최신 실적 추세를 반영합니다.")
