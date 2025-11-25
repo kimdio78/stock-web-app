@@ -7,13 +7,14 @@ import urllib3
 import FinanceDataReader as fdr
 import time
 import re
+import webbrowser
 
 # SSL 경고 무시
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- 데이터 수집 함수들 ---
 @st.cache_data(ttl=3600)
-def load_stock_data(): # 함수 이름 변경 (캐시 충돌 방지)
+def load_stock_data():
     try:
         df = fdr.StockListing('KRX')
         if not df.empty:
@@ -59,15 +60,11 @@ def get_company_info_from_naver(ticker):
         return {'name': ticker, 'overview': "로딩 실패", 'market_cap': 0}
 
 def clean_float(text):
-    """문자열에서 숫자만 추출하여 float로 변환 (이자보상배율 오류 수정용)"""
+    """문자열에서 숫자만 추출하여 float로 변환"""
     if not text or text.strip() in ['-', 'N/A', '', '.']:
         return 0.0
     try:
-        # 쉼표 제거
         text = text.replace(',', '')
-        # 숫자, 소수점, 마이너스 부호만 남김
-        import re
-        # 정규식: 음수 부호 가능, 숫자, 소수점 포함
         match = re.search(r'-?\d+\.?\d*', text)
         if match:
             return float(match.group())
@@ -116,48 +113,29 @@ def get_financials_from_naver(ticker):
 
         rows = finance_table.select("tbody > tr")
         
-        # 사용자가 요청한 모든 항목 매핑 (네이버 페이지에 존재하는 것만 매칭됨)
-        # 공백을 제거하고 비교하여 매칭 정확도 향상
+        # --- 수정된 항목 매핑 (데이터 없는 항목 제거) ---
         items_map = {
             "매출액": "revenue",
-            "매출원가": "cost_of_sales",
-            "매출총이익": "gross_profit",
-            "판매비와관리비": "sga", # 띄어쓰기 제거 버전
             "영업이익": "op_income",
-            "영업이익률": "op_margin", # 네이버 표기는 '영업이익률' 
+            "영업이익률": "op_margin",
             "당기순이익": "net_income",
-            "당기순이익(지배)": "net_income_controlling",
-            "순이익률": "net_income_margin", # 네이버 표기 기준
-            "자산총계": "assets", # 네이버 표기는 자산총계
-            "부채총계": "liabilities",
-            "자본총계": "equity",
-            "자본총계(지배)": "equity_controlling",
-            "유동비율": "current_ratio",
-            "이자보상배율": "interest_coverage_ratio",
+            "순이익률": "net_income_margin",
             "부채비율": "debt_ratio",
-            "자기자본비율": "equity_ratio",
+            "당좌비율": "quick_ratio",
+            "유보율": "reserve_ratio",
+            "ROE": "roe",
             "EPS": "eps",
-            "SPS": "sps",
-            "BPS": "bps",
-            "주당배당금": "dps",
-            "배당성향": "payout_ratio",
             "PER": "per",
-            "PSR": "psr",
-            "PBR": "pbr",
-            "EV/EBITDA": "ev_ebitda",
-            "ROE": "roe"
+            "BPS": "bps",
+            "PBR": "pbr"
         }
 
         for row in rows:
             th_text = row.th.text.strip()
-            # 텍스트 전처리: 줄바꿈 제거, 공백 제거 (매칭 확률 높임)
             th_clean = th_text.replace("\n", "").replace(" ", "")
             
             key = None
-            # 부분 일치 등으로 키 찾기
             for k_text, k_code in items_map.items():
-                # 정확히 포함되는지 확인 (예: 'ROE' in 'ROE(지배주주)')
-                # 단, '영업이익'과 '영업이익률' 구분 필요
                 if k_text in th_clean:
                     # 영업이익 vs 영업이익률 구분
                     if k_text == "영업이익" and "률" in th_clean: continue
@@ -166,10 +144,6 @@ def get_financials_from_naver(ticker):
                     key = k_code
                     break
             
-            # 이자보상배율 별도 체크 (확실하게)
-            if "이자보상배율" in th_clean:
-                key = "interest_coverage_ratio"
-
             if key:
                 cells = row.select("td")
                 for i, idx in enumerate(annual_indices):
@@ -208,7 +182,6 @@ def main():
 
     if 'search_list' not in st.session_state:
         with st.spinner('종목 데이터 로딩 중...'):
-            # 함수명 변경: load_stock_list -> load_stock_data
             st.session_state.search_list, st.session_state.search_map, st.session_state.ticker_to_name = load_stock_data()
     
     search_list = st.session_state.search_list
@@ -287,47 +260,30 @@ def main():
                 disp_data = []
                 cols = ['항목'] + [d['date'] for d in annual] + ['최근분기']
                 
-                # --- 요청하신 순서대로 항목 배치 ---
-                # 참고: 네이버 메인 요약표에 없는 데이터는 0 또는 N/A로 나올 수 있습니다.
+                # --- 수정된 표시 항목 (데이터 있는 것만) ---
                 items_display = [
                     ("매출액(억)", 'revenue'), 
-                    ("매출원가(억)", 'cost_of_sales'), 
-                    ("매출총이익(억)", 'gross_profit'),
-                    ("판매비와관리비(억)", 'sga'),
                     ("영업이익(억)", 'op_income'), 
                     ("영업이익률(%)", 'op_margin'),
                     ("당기순이익(억)", 'net_income'), 
-                    ("당기순이익(지배)(억)", 'net_income_controlling'),
-                    ("당기순이익률(지배)(%)", 'net_income_margin'),
-                    ("자산총계(억)", 'assets'), 
-                    ("부채총계(억)", 'liabilities'), 
-                    ("자본총계(억)", 'equity'),
-                    ("자본총계(지배)(억)", 'equity_controlling'),
-                    ("유동비율(%)", 'current_ratio'),
-                    ("이자보상배율(배)", 'interest_coverage_ratio'),
+                    ("순이익률(%)", 'net_income_margin'),
                     ("부채비율(%)", 'debt_ratio'), 
-                    ("자기자본비율(%)", 'equity_ratio'),
+                    ("당좌비율(%)", 'quick_ratio'), 
+                    ("유보율(%)", 'reserve_ratio'),
                     ("EPS(원)", 'eps'), 
-                    ("SPS(원)", 'sps'),
                     ("BPS(원)", 'bps'), 
-                    ("주당배당금(원)", 'dps'),
-                    ("배당성향(%)", 'payout_ratio'),
                     ("PER(배)", 'per'), 
-                    ("PSR(배)", 'psr'),
                     ("PBR(배)", 'pbr'), 
-                    ("EV/EBITDA(배)", 'ev_ebitda'),
                     ("ROE(%)", 'roe')
                 ]
                 
                 for label, key in items_display:
                     row = [label]
-                    # 데이터 포맷팅 (금액은 정수, 비율은 소수점)
                     is_money = '원' in label or '억' in label
                     
                     for d in annual:
                         val = d.get(key, 0)
-                        # 데이터가 0이면 '-' 표시 (가독성 위해)
-                        if val == 0 and key not in ['op_income', 'net_income']: # 이익은 0일수도 있으므로 제외
+                        if val == 0 and key not in ['op_income', 'net_income']:
                             row.append("-")
                         else:
                             row.append(f"{val:,.0f}" if is_money else f"{val:,.2f}")
