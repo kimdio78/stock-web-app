@@ -126,8 +126,7 @@ def get_financials_from_naver(ticker):
             "EPS": "eps",
             "PER": "per",
             "BPS": "bps",
-            "PBR": "pbr",
-            "이자보상배율": "interest_coverage_ratio"
+            "PBR": "pbr"
         }
 
         for row in rows:
@@ -142,10 +141,6 @@ def get_financials_from_naver(ticker):
                     key = k_code
                     break
             
-            # 이자보상배율 별도 체크
-            if "이자보상배율" in th_clean:
-                key = "interest_coverage_ratio"
-
             if key:
                 cells = row.select("td")
                 for i, idx in enumerate(annual_indices):
@@ -269,7 +264,8 @@ def main():
                     ("당기순이익(억)", 'net_income'), 
                     ("순이익률(%)", 'net_income_margin'),
                     ("부채비율(%)", 'debt_ratio'), 
-                    ("이자보상배율(배)", 'interest_coverage_ratio'),
+                    ("당좌비율(%)", 'quick_ratio'), 
+                    ("유보율(%)", 'reserve_ratio'),
                     ("EPS(원)", 'eps'), 
                     ("BPS(원)", 'bps'), 
                     ("PER(배)", 'per'), 
