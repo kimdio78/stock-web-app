@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import urllib3
 import FinanceDataReader as fdr
 import time
+import re
 
 # SSL 경고 무시
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -14,18 +15,18 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 @st.cache_data(ttl=3600)
 def load_stock_list():
     try:
-        # KRX 전체 종목 리스트 가져오기
         df = fdr.StockListing('KRX')
         if not df.empty:
-            # 검색 편의성을 위해 '종목명 (종목코드)' 형태의 키 생성
-            # 이 리스트는 selectbox에서 검색 대상이 됩니다.
-            df['Search_Key'] = df['Name'] + " (" + df['Code'] + ")"
-            search_map = dict(zip(df['Search_Key'], df['Code']))
-            ticker_to_name = dict(zip(df['Code'], df['Name']))
-            return search_map, ticker_to_name
+            # 검색 편의성을 위해 '종목명 (종목코드)' 형태의 리스트 생성
+            search_list = [f"{row['Name']} ({row['Code']})" for _, row in df.iterrows()]
+            # 검색용 맵핑 (검색어 -> 코드)
+            search_map = {f"{row['Name']} ({row['Code']})": row['Code'] for _, row in df.iterrows()}
+            # 표시용 맵핑 (코드 -> 이름)
+            ticker_to_name = {row['Code']: row['Name'] for _, row in df.iterrows()}
+            return search_list, search_map, ticker_to_name
     except:
         pass
-    return {}, {}
+    return [], {}, {}
 
 def get_company_info_from_naver(ticker):
     try:
@@ -58,6 +59,22 @@ def get_company_info_from_naver(ticker):
         return info
     except:
         return {'name': ticker, 'overview': "로딩 실패", 'market_cap': 0}
+
+def clean_float(text):
+    """문자열에서 숫자만 추출하여 float로 변환"""
+    if not text:
+        return 0.0
+    try:
+        # 쉼표 제거
+        text = text.replace(',', '')
+        # 정규표현식으로 숫자와 소수점, 마이너스 부호만 추출
+        import re
+        matches = re.findall(r'-?\d+\.?\d*', text)
+        if matches:
+            return float(matches[0])
+        return 0.0
+    except:
+        return 0.0
 
 def get_financials_from_naver(ticker):
     try:
@@ -100,43 +117,46 @@ def get_financials_from_naver(ticker):
 
         rows = finance_table.select("tbody > tr")
         
-        # 재무 항목 매핑 (이자보상배율 등 텍스트 매칭 유연성 확보)
+        # 재무 항목 매핑
+        items = {
+            "매출액": "revenue", "영업이익": "op_income", "당기순이익": "net_income",
+            "부채비율": "debt_ratio", 
+            "ROE(지배주주)": "roe", "EPS(원)": "eps", "PER(배)": "per", 
+            "BPS(원)": "bps", "PBR(배)": "pbr", 
+            "이자보상배율": "interest_coverage_ratio" 
+        }
+
         for row in rows:
             th_text = row.th.text.strip()
+            # 공백 제거 후 매칭 시도
+            th_clean = th_text.replace(" ", "")
             key = None
             
-            if "매출액" in th_text: key = "revenue"
-            elif "영업이익" in th_text and "률" not in th_text: key = "op_income" # 영업이익률 제외
-            elif "당기순이익" in th_text and "률" not in th_text: key = "net_income"
-            elif "부채비율" in th_text: key = "debt_ratio"
-            elif "ROE" in th_text: key = "roe"
-            elif "EPS" in th_text: key = "eps"
-            elif "PER" in th_text: key = "per"
-            elif "BPS" in th_text: key = "bps"
-            elif "PBR" in th_text: key = "pbr"
-            elif "이자보상배율" in th_text: key = "interest_coverage_ratio"
+            if "매출액" in th_clean: key = "revenue"
+            elif "영업이익" in th_clean and "률" not in th_clean: key = "op_income"
+            elif "당기순이익" in th_clean and "률" not in th_clean: key = "net_income"
+            elif "부채비율" in th_clean: key = "debt_ratio"
+            elif "ROE" in th_clean: key = "roe"
+            elif "EPS" in th_clean: key = "eps"
+            elif "PER" in th_clean: key = "per"
+            elif "BPS" in th_clean: key = "bps"
+            elif "PBR" in th_clean: key = "pbr"
+            elif "이자보상배율" in th_clean: key = "interest_coverage_ratio"
             
             if key:
                 cells = row.select("td")
                 for i, idx in enumerate(annual_indices):
                     t_idx = idx - cell_offset
                     if 0 <= t_idx < len(cells):
-                        val = cells[t_idx].text.strip().replace(",", "")
-                        if val in ['N/A', '-', '', '.', '완전잠식']:
-                            annual_data[i][key] = 0.0
-                        else:
-                            try: annual_data[i][key] = float(val)
-                            except: annual_data[i][key] = 0.0
+                        # 텍스트 추출 및 정규식 기반 숫자 변환 (가장 확실한 방법)
+                        val_text = cells[t_idx].text.strip()
+                        annual_data[i][key] = clean_float(val_text)
                 
                 if quarter_idx != -1:
                     t_idx = quarter_idx - cell_offset
                     if 0 <= t_idx < len(cells):
-                        val = cells[t_idx].text.strip().replace(",", "")
-                        if val in ['N/A', '-', '', '.', '완전잠식']:
-                            quarter_data[key] = 0.0
-                        else:
-                            try: quarter_data[key] = float(val)
-                            except: quarter_data[key] = 0.0
+                        val_text = cells[t_idx].text.strip()
+                        quarter_data[key] = clean_float(val_text)
         
         annual_data.reverse()
         return annual_data, quarter_data
@@ -149,15 +169,23 @@ def calculate_srim(bps, roe, rrr):
     fair_value = bps + (bps * excess_profit_rate / (rrr / 100))
     return fair_value
 
+# --- 세션 상태 관리 및 콜백 ---
+if 'search_key' not in st.session_state:
+    st.session_state.search_key = 0  # 검색창 리셋을 위한 키
+
+def reset_search_state():
+    st.session_state.search_key += 1 # 키 값을 변경하여 리셋 효과
+
 # --- 메인 UI ---
 def main():
     st.set_page_config(page_title="주식 적정주가 분석기", page_icon="📈")
     st.title("📈 주식 적정주가 분석기")
 
-    if 'search_map' not in st.session_state:
+    if 'search_list' not in st.session_state:
         with st.spinner('종목 데이터 로딩 중...'):
-            st.session_state.search_map, st.session_state.ticker_to_name = load_stock_list()
+            st.session_state.search_list, st.session_state.search_map, st.session_state.ticker_to_name = load_stock_list()
     
+    search_list = st.session_state.search_list
     search_map = st.session_state.search_map
     ticker_to_name = st.session_state.ticker_to_name
 
@@ -165,23 +193,35 @@ def main():
         st.header("설정")
         required_return = st.number_input("요구수익률 (%)", 1.0, 20.0, 8.0, 0.5)
 
-    # --- 1. & 2. 검색 기능 통합 (이름/코드 모두 검색 가능, 단일 창) ---
+    # --- 1. 검색 기능 개선 (리셋 버튼 추가) ---
+    st.markdown("##### 종목 검색")
+    
+    col_search, col_reset = st.columns([4, 1])
+    
     ticker = None
-    if search_map:
-        # selectbox에서 타이핑으로 검색 가능 (종목명 또는 코드 포함된 문자열 검색)
-        stock_input = st.selectbox(
-            "종목 검색 (이름 또는 코드를 입력하세요)", 
-            [""] + list(search_map.keys()),
-            index=0,
-            placeholder="종목명 또는 코드를 입력하세요..."
-        )
-        if stock_input:
-            ticker = search_map.get(stock_input)
-    else:
-        # 목록 로딩 실패 시 비상용 입력창
-        ticker_input = st.text_input("종목코드 6자리 직접 입력")
-        if ticker_input and len(ticker_input) == 6 and ticker_input.isdigit():
-            ticker = ticker_input
+    stock_input = None
+
+    with col_search:
+        if search_list:
+            # key를 session_state의 search_key로 지정하여, 버튼 클릭 시 강제 리셋 가능하게 함
+            stock_input = st.selectbox(
+                "종목을 선택하거나 입력하세요", 
+                [""] + search_list,
+                index=0,
+                key=f"stock_selectbox_{st.session_state.search_key}",
+                label_visibility="collapsed"
+            )
+            if stock_input:
+                ticker = search_map.get(stock_input)
+        else:
+            ticker_input = st.text_input("종목코드(6자리) 직접 입력", key="manual_input")
+            if ticker_input and len(ticker_input) == 6 and ticker_input.isdigit():
+                ticker = ticker_input
+    
+    with col_reset:
+        if st.button("🔄 초기화"):
+            reset_search_state()
+            st.rerun()
 
     if ticker:
         try:
@@ -206,11 +246,11 @@ def main():
             with st.expander("기업 개요"):
                 st.write(naver_info['overview'])
 
-            # 3. 차트 링크 수정 (해당 종목 차트 탭으로 직접 연결)
+            # --- 2. 차트 링크 수정 (네이버 증권 '차트' 탭으로 직행) ---
             st.markdown(f"""
-                <a href="https://m.stock.naver.com/item/main.naver?code={ticker}#/chart" target="_blank" style="text-decoration:none;">
+                <a href="https://finance.naver.com/item/fchart.naver?code={ticker}" target="_blank" style="text-decoration:none;">
                     <div style="background-color:#03C75A; color:white; padding:12px; border-radius:8px; text-align:center; font-weight:bold; margin: 10px 0;">
-                        📊 네이버 증권 차트 보러가기
+                        📊 네이버 증권 차트 새창으로 보기
                     </div>
                 </a>
                 """, unsafe_allow_html=True)
@@ -226,7 +266,7 @@ def main():
                 disp_data = []
                 cols = ['항목'] + [d['date'] for d in annual] + ['최근분기']
                 
-                # 4. & 6. 재무요약 항목 수정 (당좌비율, 유보율 삭제 / 이자보상배율 포함)
+                # 항목 리스트 (당좌비율, 유보율 삭제됨)
                 items = [
                     ("매출액(억)", 'revenue'), ("영업이익(억)", 'op_income'), ("순이익(억)", 'net_income'),
                     ("ROE(%)", 'roe'), ("부채비율(%)", 'debt_ratio'),
@@ -252,7 +292,7 @@ def main():
                 
                 bps = annual[-1].get('bps', 0)
                 
-                # 3년 ROE 데이터 추출 (최신순 정렬되어 있으므로 뒤에서부터 3개)
+                # 3년 ROE 데이터 추출
                 roe_history = []
                 for d in annual:
                     if d.get('roe'):
@@ -265,7 +305,7 @@ def main():
                 val_3yr = calculate_srim(bps, avg_roe, required_return)
                 val_1yr = calculate_srim(bps, roe_1yr, required_return)
 
-                # 폰트 스타일 (일반 폰트 사용)
+                # 폰트 스타일
                 st.markdown("""
                 <style>
                 .calc-box {
@@ -295,7 +335,6 @@ def main():
 
                     st.markdown("#### 🧮 산출 근거")
                     
-                    # 5. 입력 변수 표 (요구수익률 삭제, ROE 데이터 별도 표)
                     col_input1, col_input2 = st.columns(2)
                     
                     with col_input1:
@@ -316,7 +355,6 @@ def main():
                             st.markdown("**2. ROE 상세 내역**")
                             st.write(f"최근 결산 ROE: {roe_used:.2f}%")
 
-                    # 계산 과정 (수식 폰트 통일)
                     st.markdown("**3. 계산 과정**")
                     excess_rate = roe_used - required_return
                     
