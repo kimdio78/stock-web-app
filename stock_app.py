@@ -16,8 +16,11 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 @st.cache_data(ttl=3600)
 def load_stock_data():
     try:
+        # KRX 전체 종목 리스트 가져오기
         df = fdr.StockListing('KRX')
         if not df.empty:
+            # 검색 키 생성: "삼성전자 (005930)" 형태
+            # 이렇게 해야 이름으로 검색했을 때 목록에 뜹니다.
             df['Search_Key'] = df['Name'] + " (" + df['Code'] + ")"
             search_map = dict(zip(df['Search_Key'], df['Code']))
             ticker_to_name = dict(zip(df['Code'], df['Name']))
@@ -45,24 +48,14 @@ def get_company_info_from_naver(ticker):
             if overview_div:
                 info['overview'] = "\n ".join([p.text.strip() for p in overview_div.select("p") if p.text.strip()])
             
-            # 시가총액 추출 (수정된 로직)
             try:
                 mc_element = soup.select_one("#_market_sum")
                 if mc_element:
-                    raw_mc = mc_element.text.strip() # 예: "39조 8,121" 또는 "3,456"
-                    
-                    market_cap_okwon = 0
-                    if '조' in raw_mc:
-                        parts = raw_mc.split('조')
-                        trillion = int(parts[0].replace(',', ''))
-                        billion_str = parts[1].replace(',', '').strip()
-                        billion = int(billion_str) if billion_str else 0
-                        market_cap_okwon = trillion * 10000 + billion
-                    else:
-                        market_cap_okwon = int(raw_mc.replace(',', ''))
-                    
-                    # 원 단위로 변환하여 저장
-                    info['market_cap'] = market_cap_okwon * 100000000
+                    raw_mc = mc_element.text.strip().replace(',', '').replace('조', '').replace(' ', '')
+                    parts = raw_mc.split('조')
+                    trillion = int(parts[0]) if parts[0] else 0
+                    billion = int(parts[1]) if len(parts) > 1 and parts[1] else 0
+                    info['market_cap'] = (trillion * 10000 + billion) * 100000000
             except:
                 pass
         return info
@@ -185,7 +178,7 @@ def reset_search_state():
 # --- 메인 UI ---
 def main():
     st.set_page_config(page_title="주식 적정주가 분석기", page_icon="📈")
-    # st.title 삭제 (요청사항 반영)
+    st.title("📈 주식 적정주가 분석기")
 
     if 'search_list' not in st.session_state:
         with st.spinner('종목 데이터 로딩 중...'):
@@ -199,26 +192,28 @@ def main():
         st.header("설정")
         required_return = st.number_input("요구수익률 (%)", 1.0, 20.0, 8.0, 0.5)
 
+    # --- 검색 UI 개선 (이름 검색 가능, 코드 직접 입력 삭제) ---
     st.markdown("##### 종목 검색")
+    
     col_search, col_reset = st.columns([4, 1])
     
     ticker = None
+    
     with col_search:
         if search_list:
+            # selectbox를 사용하여 입력 시 자동완성 및 리스트 필터링 기능 제공
             stock_input = st.selectbox(
-                "종목을 선택하거나 입력하세요", 
-                [""] + search_list,
+                "종목을 입력하세요 (예: 삼성전자)", 
+                options=[""] + search_list,
                 index=0,
-                key=f"stock_selectbox_{st.session_state.search_key}",
+                key=f"stock_selectbox_{st.session_state.search_key}", # 초기화 버튼을 위한 동적 키
                 label_visibility="collapsed",
-                placeholder="종목명 또는 코드를 입력하세요..."
+                placeholder="종목명 입력 (예: 삼성전자)" # 검색 유도 문구
             )
             if stock_input:
                 ticker = search_map.get(stock_input)
         else:
-            ticker_input = st.text_input("종목코드(6자리) 직접 입력")
-            if ticker_input and len(ticker_input) == 6 and ticker_input.isdigit():
-                ticker = ticker_input
+            st.error("종목 리스트를 불러오지 못했습니다. 잠시 후 '초기화' 버튼을 눌러주세요.")
     
     with col_reset:
         if st.button("🔄 초기화"):
@@ -243,7 +238,6 @@ def main():
             col1, col2 = st.columns(2)
             col1.metric("현재가", f"{curr_price:,.0f} 원")
             if naver_info['market_cap'] > 0:
-                # 시가총액 계산 로직 수정으로 정확한 억원 단위 표시 가능
                 col2.metric("시가총액", f"{naver_info['market_cap']/100000000:,.0f} 억원")
 
             with st.expander("기업 개요"):
