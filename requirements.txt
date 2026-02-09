@@ -4,3 +4,5 @@ pandas
 requests
 beautifulsoup4
 lxml
+pykrx
+setuptools
