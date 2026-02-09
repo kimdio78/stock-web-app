@@ -45,14 +45,24 @@ def get_company_info_from_naver(ticker):
             if overview_div:
                 info['overview'] = "\n ".join([p.text.strip() for p in overview_div.select("p") if p.text.strip()])
             
+            # 시가총액 추출 (수정된 로직)
             try:
                 mc_element = soup.select_one("#_market_sum")
                 if mc_element:
-                    raw_mc = mc_element.text.strip().replace(',', '').replace('조', '').replace(' ', '')
-                    parts = raw_mc.split('조')
-                    trillion = int(parts[0]) if parts[0] else 0
-                    billion = int(parts[1]) if len(parts) > 1 and parts[1] else 0
-                    info['market_cap'] = (trillion * 10000 + billion) * 100000000
+                    raw_mc = mc_element.text.strip() # 예: "39조 8,121" 또는 "3,456"
+                    
+                    market_cap_okwon = 0
+                    if '조' in raw_mc:
+                        parts = raw_mc.split('조')
+                        trillion = int(parts[0].replace(',', ''))
+                        billion_str = parts[1].replace(',', '').strip()
+                        billion = int(billion_str) if billion_str else 0
+                        market_cap_okwon = trillion * 10000 + billion
+                    else:
+                        market_cap_okwon = int(raw_mc.replace(',', ''))
+                    
+                    # 원 단위로 변환하여 저장
+                    info['market_cap'] = market_cap_okwon * 100000000
             except:
                 pass
         return info
@@ -175,7 +185,7 @@ def reset_search_state():
 # --- 메인 UI ---
 def main():
     st.set_page_config(page_title="주식 적정주가 분석기", page_icon="📈")
-    st.title("📈 주식 적정주가 분석기")
+    # st.title 삭제 (요청사항 반영)
 
     if 'search_list' not in st.session_state:
         with st.spinner('종목 데이터 로딩 중...'):
@@ -233,6 +243,7 @@ def main():
             col1, col2 = st.columns(2)
             col1.metric("현재가", f"{curr_price:,.0f} 원")
             if naver_info['market_cap'] > 0:
+                # 시가총액 계산 로직 수정으로 정확한 억원 단위 표시 가능
                 col2.metric("시가총액", f"{naver_info['market_cap']/100000000:,.0f} 억원")
 
             with st.expander("기업 개요"):
@@ -294,7 +305,6 @@ def main():
                 
                 df_table = pd.DataFrame(disp_data, columns=cols)
                 
-                # --- CSS 수정: 배경색을 강제로 흰색/검은색으로 지정하여 겹침 방지 ---
                 st.markdown("""
                 <style>
                 .scroll-table {
@@ -312,7 +322,7 @@ def main():
                     padding: 8px;
                     border-bottom: 1px solid #ddd;
                     min-width: 80px;
-                    background-color: #f0f2f6; /* 라이트 모드 헤더 */
+                    background-color: #f0f2f6;
                     color: #000;
                 }
                 .scroll-table td {
@@ -320,34 +330,30 @@ def main():
                     padding: 8px;
                     border-bottom: 1px solid #ddd;
                 }
-                
-                /* 첫 번째 열 고정 및 불투명 배경 설정 */
                 .scroll-table th:first-child, 
                 .scroll-table td:first-child {
                     position: sticky;
                     left: 0;
                     z-index: 10;
-                    border-right: 2px solid #ccc; /* 경계선 강조 */
+                    border-right: 2px solid #ccc;
                     text-align: left;
                     font-weight: bold;
-                    background-color: #ffffff; /* 라이트 모드 기본 배경 (흰색) */
+                    background-color: #ffffff;
                     color: #000000;
                 }
-
-                /* 다크 모드 대응 (미디어 쿼리 사용) */
                 @media (prefers-color-scheme: dark) {
                     .scroll-table th {
-                        background-color: #262730; /* 다크 모드 헤더 */
+                        background-color: #262730;
                         color: #fff;
                         border-bottom: 1px solid #444;
                     }
                     .scroll-table td {
                         border-bottom: 1px solid #444;
-                        color: #fff; /* 다크 모드 글자색 */
+                        color: #fff;
                     }
                     .scroll-table th:first-child, 
                     .scroll-table td:first-child {
-                        background-color: #0e1117; /* 다크 모드 배경 (검은색 계열) */
+                        background-color: #0e1117;
                         color: #fff;
                         border-right: 2px solid #555;
                     }
