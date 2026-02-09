@@ -19,8 +19,6 @@ def load_stock_data():
         # KRX 전체 종목 리스트 가져오기
         df = fdr.StockListing('KRX')
         if not df.empty:
-            # 검색 키 생성: "삼성전자 (005930)" 형태
-            # 이렇게 해야 이름으로 검색했을 때 목록에 뜹니다.
             df['Search_Key'] = df['Name'] + " (" + df['Code'] + ")"
             search_map = dict(zip(df['Search_Key'], df['Code']))
             ticker_to_name = dict(zip(df['Code'], df['Name']))
@@ -51,11 +49,22 @@ def get_company_info_from_naver(ticker):
             try:
                 mc_element = soup.select_one("#_market_sum")
                 if mc_element:
-                    raw_mc = mc_element.text.strip().replace(',', '').replace('조', '').replace(' ', '')
-                    parts = raw_mc.split('조')
-                    trillion = int(parts[0]) if parts[0] else 0
-                    billion = int(parts[1]) if len(parts) > 1 and parts[1] else 0
-                    info['market_cap'] = (trillion * 10000 + billion) * 100000000
+                    raw_mc = mc_element.text.strip()
+                    
+                    market_cap_okwon = 0
+                    if '조' in raw_mc:
+                        parts = raw_mc.split('조')
+                        trillion_part = parts[0].strip().replace(',', '')
+                        billion_part = parts[1].strip().replace(',', '')
+                        
+                        trillion = int(trillion_part) if trillion_part else 0
+                        billion = int(billion_part) if billion_part else 0
+                        
+                        market_cap_okwon = trillion * 10000 + billion
+                    else:
+                        market_cap_okwon = int(raw_mc.replace(',', ''))
+                    
+                    info['market_cap'] = market_cap_okwon * 100000000
             except:
                 pass
         return info
@@ -63,7 +72,6 @@ def get_company_info_from_naver(ticker):
         return {'name': ticker, 'overview': "로딩 실패", 'market_cap': 0}
 
 def clean_float(text):
-    """문자열에서 숫자만 추출하여 float로 변환"""
     if not text or text.strip() in ['-', 'N/A', '', '.']:
         return 0.0
     try:
@@ -178,8 +186,8 @@ def reset_search_state():
 # --- 메인 UI ---
 def main():
     st.set_page_config(page_title="주식 적정주가 분석기", page_icon="📈")
-    st.title("📈 주식 적정주가 분석기")
-
+    
+    # 1. 데이터 로드 (실패해도 빈 리스트 반환하여 진행)
     if 'search_list' not in st.session_state:
         with st.spinner('종목 데이터 로딩 중...'):
             st.session_state.search_list, st.session_state.search_map, st.session_state.ticker_to_name = load_stock_data()
@@ -192,32 +200,38 @@ def main():
         st.header("설정")
         required_return = st.number_input("요구수익률 (%)", 1.0, 20.0, 8.0, 0.5)
 
-    # --- 검색 UI 개선 (이름 검색 가능, 코드 직접 입력 삭제) ---
     st.markdown("##### 종목 검색")
-    
     col_search, col_reset = st.columns([4, 1])
     
     ticker = None
     
+    # 2. 검색 UI 로직 수정 (리스트 없으면 입력창 표시)
     with col_search:
         if search_list:
-            # selectbox를 사용하여 입력 시 자동완성 및 리스트 필터링 기능 제공
             stock_input = st.selectbox(
-                "종목을 입력하세요 (예: 삼성전자)", 
-                options=[""] + search_list,
+                "종목을 선택하거나 입력하세요", 
+                [""] + search_list,
                 index=0,
-                key=f"stock_selectbox_{st.session_state.search_key}", # 초기화 버튼을 위한 동적 키
+                key=f"stock_selectbox_{st.session_state.search_key}",
                 label_visibility="collapsed",
-                placeholder="종목명 입력 (예: 삼성전자)" # 검색 유도 문구
+                placeholder="종목명 또는 코드를 입력하세요..."
             )
             if stock_input:
                 ticker = search_map.get(stock_input)
         else:
-            st.error("종목 리스트를 불러오지 못했습니다. 잠시 후 '초기화' 버튼을 눌러주세요.")
+            # 리스트 로딩 실패 시 비상용 입력창 표시
+            st.warning("종목 목록을 불러오지 못했습니다. 코드를 직접 입력해주세요.")
+            ticker_input = st.text_input("종목코드(6자리) 입력", max_chars=6, placeholder="예: 005930")
+            if ticker_input and len(ticker_input) == 6 and ticker_input.isdigit():
+                ticker = ticker_input
     
     with col_reset:
         if st.button("🔄 초기화"):
             reset_search_state()
+            # 캐시 삭제 후 재시작 (목록 다시 불러오기 시도)
+            st.cache_data.clear()
+            if 'search_list' in st.session_state:
+                del st.session_state['search_list']
             st.rerun()
 
     if ticker:
@@ -230,6 +244,8 @@ def main():
             curr_price = df_price['Close'].iloc[-1]
             naver_info = get_company_info_from_naver(ticker)
             annual, quarter = get_financials_from_naver(ticker)
+            
+            # 리스트 로딩 실패 시 ticker_to_name이 비어있을 수 있으므로 처리
             display_name = ticker_to_name.get(ticker, naver_info['name'])
 
             st.divider()
