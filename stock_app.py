@@ -162,6 +162,53 @@ def get_investor_trend(ticker):
     except:
         return []
 
+# --- 신규 추가: 동일업종 비교 크롤링 ---
+def get_same_industry_comparison(ticker):
+    try:
+        url = f"https://finance.naver.com/item/main.naver?code={ticker}"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers, verify=False)
+        
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, 'html.parser')
+            # '동일업종비교' 섹션 찾기
+            compare_section = soup.select_one("div.section.trade_compare")
+            if compare_section:
+                table = compare_section.select_one("table")
+                if table:
+                    # 헤더 (종목명)
+                    headers = ["구분"]
+                    thead = table.select_one("thead")
+                    for th in thead.select("th"):
+                        # 링크가 있는 경우 종목명, 없으면 구분(현재가 등)
+                        if th.find("a"):
+                            headers.append(th.text.strip())
+                    
+                    # 데이터 (행 단위)
+                    rows_data = []
+                    tbody = table.select_one("tbody")
+                    for tr in tbody.select("tr"):
+                        row_val = []
+                        # 첫번째 th는 항목명
+                        th_item = tr.select_one("th")
+                        if th_item:
+                            row_val.append(th_item.text.strip())
+                        
+                        # 나머지 td는 값
+                        for td in tr.select("td"):
+                            row_val.append(td.text.strip())
+                        
+                        # 헤더 개수와 데이터 개수가 맞으면 추가 (일부 숨김 열 등으로 안 맞을 수 있음 방지)
+                        if len(row_val) == len(headers):
+                             rows_data.append(row_val)
+                        elif len(row_val) > len(headers): # 데이터가 더 많으면 자름
+                             rows_data.append(row_val[:len(headers)])
+
+                    return pd.DataFrame(rows_data, columns=headers)
+        return pd.DataFrame()
+    except:
+        return pd.DataFrame()
+
 def clean_float(text):
     if not text or text.strip() in ['-', 'N/A', '', '.']:
         return 0.0
@@ -175,92 +222,6 @@ def clean_float(text):
         return 0.0
 
 def get_financials_from_naver(ticker, current_price=0, shares=0):
-    """
-    1차: WiseReport 크롤링 (상세, 5년)
-    2차: 네이버 금융 메인 (백업, 3~4년)
-    """
-    # 1차 시도: WiseReport
-    try:
-        url = f"https://navercomp.wisereport.co.kr/v2/company/c1010001.aspx?cmp_cd={ticker}"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(url, headers=headers, verify=False, timeout=5)
-        
-        if response.status_code == 200:
-            dfs = pd.read_html(response.text, encoding='utf-8')
-            df_fin = None
-            for df in dfs:
-                if df.shape[1] > 0 and df.iloc[:, 0].astype(str).str.contains('매출액').any():
-                    df_fin = df
-                    break
-            
-            if df_fin is not None:
-                # WiseReport 데이터 처리 로직 (기존과 동일)
-                df_fin = df_fin.set_index(df_fin.columns[0])
-                cols = df_fin.columns
-                if isinstance(cols, pd.MultiIndex): date_cols = [c[1] for c in cols]
-                else: date_cols = cols
-
-                n_cols = len(cols)
-                mid_point = n_cols // 2
-                
-                annual_data = []
-                for i in range(mid_point):
-                    col_name = str(date_cols[i])
-                    if "(E)" not in col_name: annual_data.append({'date': col_name, 'col_idx': i})
-                annual_data = annual_data[-5:]
-
-                quarter_data = []
-                for i in range(mid_point, n_cols):
-                    col_name = str(date_cols[i])
-                    if "(E)" not in col_name: quarter_data.append({'date': col_name, 'col_idx': i})
-                quarter_data = quarter_data[-5:]
-
-                items_map = {
-                    "매출액": "revenue", "영업이익": "op_income", "당기순이익": "net_income",
-                    "영업이익률": "op_margin", "순이익률": "net_income_margin", "ROE": "roe",
-                    "부채비율": "debt_ratio", "당좌비율": "quick_ratio", "유보율": "reserve_ratio",
-                    "EPS": "eps", "BPS": "bps", "PER": "per", "PBR": "pbr",
-                    "주당배당금": "dps", "배당성향": "payout_ratio", "시가배당률": "dividend_yield",
-                    "이자보상배율": "interest_coverage_ratio", "EV/EBITDA": "ev_ebitda", 
-                    "영업활동현금흐름": "operating_cash_flow" 
-                }
-                
-                def extract_data(data_list, is_quarter=False):
-                    result = []
-                    for d in data_list:
-                        item_dict = {'date': d['date']}
-                        for idx_name, row in df_fin.iterrows():
-                            idx_clean = str(idx_name).replace(" ", "").replace("\xa0", "")
-                            val = row.iloc[d['col_idx']]
-                            for k_txt, k_key in items_map.items():
-                                if k_txt in idx_clean:
-                                    if k_txt == "영업이익" and "률" in idx_clean: continue
-                                    if k_txt == "당기순이익" and "률" in idx_clean: continue
-                                    item_dict[k_key] = clean_float(str(val))
-                                    break
-                        
-                        # 지표 계산
-                        revenue = item_dict.get('revenue', 0)
-                        if revenue and shares > 0:
-                            sps = (revenue * 100000000) / shares
-                            item_dict['sps'] = sps if not is_quarter else sps * 4 # 분기는 연환산? 단순화
-                        
-                        ocf = item_dict.get('operating_cash_flow', 0)
-                        if ocf and shares > 0:
-                            item_dict['cps'] = (ocf * 100000000) / shares
-
-                        if current_price > 0:
-                            if item_dict.get('sps'): item_dict['psr'] = current_price / item_dict['sps']
-                            if item_dict.get('cps'): item_dict['pcr'] = current_price / item_dict['cps']
-
-                        result.append(item_dict)
-                    return result
-
-                return extract_data(annual_data), extract_data(quarter_data, is_quarter=True)
-    except:
-        pass
-
-    # 2차 시도: 네이버 금융 메인 (Fallback)
     try:
         url = f"https://finance.naver.com/item/main.naver?code={ticker}"
         headers = {'User-Agent': 'Mozilla/5.0'}
@@ -272,9 +233,18 @@ def get_financials_from_naver(ticker, current_price=0, shares=0):
         header_rows = finance_table.select("thead > tr")
         date_cols = [th.text.strip() for th in header_rows[1].select("th")]
         
-        # 인덱스 구분 (단순화: 앞 4개 연간, 뒤 6개 분기 가정)
-        annual_idxs = [i for i, x in enumerate(date_cols[:4]) if "(E)" not in x]
-        quarter_idxs = [i+4 for i, x in enumerate(date_cols[4:]) if "(E)" not in x]
+        annual_idxs = []
+        quarter_idxs = []
+        
+        # (E) 제외 로직
+        for i, col in enumerate(date_cols):
+             # 간단하게 앞쪽 절반 연간, 뒤쪽 절반 분기 로직 적용 (네이버 구조상)
+             if i < 4 and "(E)" not in col: annual_idxs.append(i)
+             elif i >= 4 and "(E)" not in col: quarter_idxs.append(i)
+        
+        # 최근 5개 (부족하면 있는대로)
+        annual_idxs = annual_idxs[-5:]
+        quarter_idxs = quarter_idxs[-5:]
 
         annual_data = [{'date': date_cols[i].split('(')[0]} for i in annual_idxs]
         quarter_data = [{'date': date_cols[i].split('(')[0]} for i in quarter_idxs]
@@ -286,7 +256,6 @@ def get_financials_from_naver(ticker, current_price=0, shares=0):
             "부채비율": "debt_ratio", "당좌비율": "quick_ratio", "유보율": "reserve_ratio",
             "EPS": "eps", "BPS": "bps", "PER": "per", "PBR": "pbr",
             "주당배당금": "dps", "배당성향": "payout_ratio", "시가배당률": "dividend_yield",
-            "이자보상배율": "interest_coverage_ratio"
         }
 
         def fill_data(target_list, indices):
@@ -300,16 +269,15 @@ def get_financials_from_naver(ticker, current_price=0, shares=0):
                              if k_txt == "당기순이익" and "률" in th_text: continue
                              key = k_key
                              break
-                    if "이자보상배율" in th_text: key = "interest_coverage_ratio"
 
                     if key:
                         cells = row.select("td")
-                        cell_offset = len(date_cols) - len(cells) # 보통 offset 0
+                        cell_offset = len(date_cols) - len(cells)
                         t_idx = idx - cell_offset
                         if 0 <= t_idx < len(cells):
                             target_list[i][key] = clean_float(cells[t_idx].text.strip())
                 
-                # 추가 지표 계산 (SPS, PSR 등)
+                # 추가 지표 계산 (SPS, PSR) - CPS, PCR, EV/EBITDA는 삭제 요청으로 제외
                 rev = target_list[i].get('revenue', 0)
                 if rev and shares > 0:
                      sps = (rev * 100000000) / shares
@@ -381,13 +349,16 @@ def main():
 
     if ticker:
         try:
+            # 1. 상세 정보 크롤링 (네이버)
             info = get_naver_stock_details(ticker)
             try: curr_price = float(info['now_price'].replace(',', ''))
             except: curr_price = 0
             
-            annual_list, quarter_list = get_financials_from_naver(ticker, curr_price, info.get('shares', 0))
+            annual, quarter = get_financials_from_naver(ticker, curr_price, info.get('shares', 0))
             investor_trends = get_investor_trend(ticker)
+            industry_compare_df = get_same_industry_comparison(ticker) # 동일업종 비교
             
+            # --- 상단 상세 정보 패널 ---
             st.markdown(f"### {info['name']} ({ticker})")
             
             diff_color = "black"
@@ -504,6 +475,7 @@ def main():
                 trend_html += "</tbody></table></div>"
                 st.markdown(trend_html, unsafe_allow_html=True)
 
+            # --- CSS 스타일 (표) ---
             st.markdown("""
             <style>
             .scroll-table { overflow-x: auto; white-space: nowrap; margin-bottom: 10px; }
@@ -522,23 +494,24 @@ def main():
             </style>
             """, unsafe_allow_html=True)
 
+            # 수정된 항목 리스트 (요청하신대로 삭제 후 남은 항목)
             items_display = [
                 ("매출액(억)", 'revenue'), ("영업이익(억)", 'op_income'), ("영업이익률(%)", 'op_margin'),
                 ("당기순이익(억)", 'net_income'), ("순이익률(%)", 'net_income_margin'),
                 ("부채비율(%)", 'debt_ratio'), ("당좌비율(%)", 'quick_ratio'), ("유보율(%)", 'reserve_ratio'),
-                ("EPS(원)", 'eps'), ("BPS(원)", 'bps'), ("CPS(원)", 'cps'), ("SPS(원)", 'sps'),
-                ("PER(배)", 'per'), ("PBR(배)", 'pbr'), ("PCR(배)", 'pcr'), ("PSR(배)", 'psr'),
-                ("EV/EBITDA(배)", 'ev_ebitda'), ("ROE(%)", 'roe'), ("이자보상배율(배)", 'interest_coverage_ratio')
+                ("EPS(원)", 'eps'), ("BPS(원)", 'bps'), ("SPS(원)", 'sps'),
+                ("PER(배)", 'per'), ("PBR(배)", 'pbr'), ("PSR(배)", 'psr'),
+                ("ROE(%)", 'roe')
             ]
 
-            if annual_list:
+            if annual:
                 st.markdown("### 📊 연간 재무제표 (최근 5년)")
                 disp_annual = []
-                cols_annual = ['항목'] + [d['date'] for d in annual_list]
+                cols_annual = ['항목'] + [d['date'] for d in annual]
                 for label, key in items_display:
                     row = [label]
                     is_money = '원' in label or '억' in label
-                    for d in annual_list:
+                    for d in annual:
                         val = d.get(key, 0)
                         if val == 0 and key not in ['op_income', 'net_income']: row.append("-")
                         else: row.append(f"{val:,.0f}" if is_money else f"{val:,.2f}")
@@ -547,14 +520,14 @@ def main():
                 html_annual = df_annual.to_html(index=False, border=0, classes='scroll-table-content')
                 st.markdown(f'<div class="scroll-table">{html_annual}</div>', unsafe_allow_html=True)
 
-            if quarter_list:
+            if quarter:
                 st.markdown("### 📊 분기 재무제표 (최근 5분기)")
                 disp_quarter = []
-                cols_quarter = ['항목'] + [d['date'] for d in quarter_list]
+                cols_quarter = ['항목'] + [d['date'] for d in quarter]
                 for label, key in items_display:
                     row = [label]
                     is_money = '원' in label or '억' in label
-                    for d in quarter_list:
+                    for d in quarter:
                         val = d.get(key, 0)
                         if val == 0 and key not in ['op_income', 'net_income']: row.append("-")
                         else: row.append(f"{val:,.0f}" if is_money else f"{val:,.2f}")
@@ -563,8 +536,14 @@ def main():
                 html_quarter = df_quarter.to_html(index=False, border=0, classes='scroll-table-content')
                 st.markdown(f'<div class="scroll-table">{html_quarter}</div>', unsafe_allow_html=True)
 
-            if not annual_list and not quarter_list:
+            if not annual and not quarter:
                 st.warning("재무 데이터를 불러올 수 없습니다.")
+
+            # --- 신규 추가: 동일업종 비교 ---
+            if not industry_compare_df.empty:
+                st.markdown("### 👯 동일업종 비교")
+                html_compare = industry_compare_df.to_html(index=False, border=0, classes='scroll-table-content')
+                st.markdown(f'<div class="scroll-table">{html_compare}</div>', unsafe_allow_html=True)
 
             st.divider()
             st.markdown("### 💰 S-RIM 적정주가 분석")
@@ -604,10 +583,10 @@ def main():
                     st.markdown(f"**② 적정주가** = {bps:,.0f} (BPS) + ( {bps:,.0f} × {excess_rate:.2f}% ÷ {required_return}% ) ≈ **{val:,.0f} 원**")
 
             # 1. 최근 3년 실적 평균 기준 (연간)
-            if annual_list:
-                bps_annual = annual_list[-1].get('bps', 0)
+            if annual:
+                bps_annual = annual[-1].get('bps', 0)
                 roe_history_annual = []
-                for d in annual_list:
+                for d in annual:
                     if d.get('roe'): roe_history_annual.append({'연도': d['date'], 'ROE': d['roe']})
                 
                 roe_history_annual_3yr = roe_history_annual[-3:]
@@ -618,10 +597,10 @@ def main():
             st.divider()
 
             # 2. 최근 3분기 실적 평균 기준 (분기)
-            if quarter_list:
-                bps_quarter = quarter_list[-1].get('bps', 0)
+            if quarter:
+                bps_quarter = quarter[-1].get('bps', 0)
                 roe_history_quarter = []
-                for d in quarter_list:
+                for d in quarter:
                     if d.get('roe'): roe_history_quarter.append({'분기': d['date'], 'ROE': d['roe']})
                 
                 roe_history_quarter_3q = roe_history_quarter[-3:]
