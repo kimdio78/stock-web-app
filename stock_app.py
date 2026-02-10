@@ -162,7 +162,7 @@ def get_investor_trend(ticker):
     except:
         return []
 
-# --- 신규 추가: 동일업종 비교 크롤링 ---
+# --- 동일업종 비교 크롤링 (텍스트 정제 기능 강화) ---
 def get_same_industry_comparison(ticker):
     try:
         url = f"https://finance.naver.com/item/main.naver?code={ticker}"
@@ -180,7 +180,6 @@ def get_same_industry_comparison(ticker):
                     headers = ["구분"]
                     thead = table.select_one("thead")
                     for th in thead.select("th"):
-                        # 링크가 있는 경우 종목명, 없으면 구분(현재가 등)
                         if th.find("a"):
                             headers.append(th.text.strip())
                     
@@ -194,14 +193,17 @@ def get_same_industry_comparison(ticker):
                         if th_item:
                             row_val.append(th_item.text.strip())
                         
-                        # 나머지 td는 값
+                        # 나머지 td는 값 (여기서 텍스트 정제 수행)
                         for td in tr.select("td"):
-                            row_val.append(td.text.strip())
+                            raw_text = td.text.strip()
+                            # 1. 개행문자, 탭 제거 및 공백 하나로 통일
+                            clean_text = re.sub(r'[\n\t]+', ' ', raw_text)
+                            clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+                            row_val.append(clean_text)
                         
-                        # 헤더 개수와 데이터 개수가 맞으면 추가 (일부 숨김 열 등으로 안 맞을 수 있음 방지)
                         if len(row_val) == len(headers):
                              rows_data.append(row_val)
-                        elif len(row_val) > len(headers): # 데이터가 더 많으면 자름
+                        elif len(row_val) > len(headers):
                              rows_data.append(row_val[:len(headers)])
 
                     return pd.DataFrame(rows_data, columns=headers)
@@ -236,13 +238,10 @@ def get_financials_from_naver(ticker, current_price=0, shares=0):
         annual_idxs = []
         quarter_idxs = []
         
-        # (E) 제외 로직
         for i, col in enumerate(date_cols):
-             # 간단하게 앞쪽 절반 연간, 뒤쪽 절반 분기 로직 적용 (네이버 구조상)
              if i < 4 and "(E)" not in col: annual_idxs.append(i)
              elif i >= 4 and "(E)" not in col: quarter_idxs.append(i)
         
-        # 최근 5개 (부족하면 있는대로)
         annual_idxs = annual_idxs[-5:]
         quarter_idxs = quarter_idxs[-5:]
 
@@ -277,7 +276,6 @@ def get_financials_from_naver(ticker, current_price=0, shares=0):
                         if 0 <= t_idx < len(cells):
                             target_list[i][key] = clean_float(cells[t_idx].text.strip())
                 
-                # 추가 지표 계산 (SPS, PSR) - CPS, PCR, EV/EBITDA는 삭제 요청으로 제외
                 rev = target_list[i].get('revenue', 0)
                 if rev and shares > 0:
                      sps = (rev * 100000000) / shares
@@ -364,10 +362,10 @@ def main():
             diff_color = "black"
             diff_arrow = ""
             if info['direction'] in ['up', 'upper']:
-                diff_color = "#d20000"
+                diff_color = "#d20000" # 빨강
                 diff_arrow = "▲"
             elif info['direction'] in ['down', 'lower']:
-                diff_color = "#0051c7"
+                diff_color = "#0051c7" # 파랑
                 diff_arrow = "▼"
             
             st.markdown(f"""
@@ -494,7 +492,6 @@ def main():
             </style>
             """, unsafe_allow_html=True)
 
-            # 수정된 항목 리스트 (요청하신대로 삭제 후 남은 항목)
             items_display = [
                 ("매출액(억)", 'revenue'), ("영업이익(억)", 'op_income'), ("영업이익률(%)", 'op_margin'),
                 ("당기순이익(억)", 'net_income'), ("순이익률(%)", 'net_income_margin'),
