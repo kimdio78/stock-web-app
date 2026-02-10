@@ -30,7 +30,6 @@ def load_stock_data():
 def get_naver_stock_details(ticker):
     """
     네이버 금융 메인 페이지에서 상세 주가 정보를 크롤링합니다.
-    (현재가, 등락, 시가총액, 외국인소진율, 52주최고/최저, PER, EPS, PBR, BPS, 배당수익률 등)
     """
     try:
         url = f"https://finance.naver.com/item/main.naver?code={ticker}"
@@ -59,13 +58,11 @@ def get_naver_stock_details(ticker):
             if overview_div:
                 data['overview'] = "\n ".join([p.text.strip() for p in overview_div.select("p") if p.text.strip()])
 
-            # 3. 현재가 및 등락률 (rate_info 영역)
+            # 3. 현재가 및 등락률
             try:
-                # 현재가
                 now_tag = soup.select_one(".no_today .blind")
                 if now_tag: data['now_price'] = now_tag.text.strip()
                 
-                # 전일대비 (상승/하락/보합 및 값)
                 exday_tag = soup.select_one(".no_exday")
                 if exday_tag:
                     spans = exday_tag.select("span.blind")
@@ -73,21 +70,20 @@ def get_naver_stock_details(ticker):
                         data['diff_amount'] = spans[0].text.strip()
                         data['diff_rate'] = spans[1].text.strip()
                     
-                    # 방향 확인 (상승/하락 아이콘 클래스)
                     if exday_tag.select_one(".ico.up"): data['direction'] = 'up'
                     elif exday_tag.select_one(".ico.down"): data['direction'] = 'down'
-                    elif exday_tag.select_one(".ico.upper"): data['direction'] = 'upper' # 상한가
-                    elif exday_tag.select_one(".ico.lower"): data['direction'] = 'lower' # 하한가
+                    elif exday_tag.select_one(".ico.upper"): data['direction'] = 'upper'
+                    elif exday_tag.select_one(".ico.lower"): data['direction'] = 'lower'
             except: pass
 
-            # 4. 시가총액 (_market_sum ID 사용)
+            # 4. 시가총액
             try:
                 mc_element = soup.select_one("#_market_sum")
                 if mc_element:
                     data['market_cap'] = mc_element.text.strip().replace('\t', '').replace('\n', '') + " 억원"
             except: pass
 
-            # 5. 투자정보 (ID 기반 추출)
+            # 5. 투자정보
             try:
                 per_el = soup.select_one("#_per")
                 if per_el: data['per'] = per_el.text.strip()
@@ -102,17 +98,13 @@ def get_naver_stock_details(ticker):
                 if dvr_el: data['dvr'] = dvr_el.text.strip()
             except: pass
 
-            # 6. 테이블 기반 추출 (외국인소진율, 52주최고/최저, BPS 등)
-            # BPS는 ID가 없는 경우가 있어 텍스트 검색 사용 가능, 하지만 여기서는 html 구조상 PBR 옆에 있음
-            # 외국인 소진율
+            # 6. 기타 정보 (외국인소진율, 52주최고/최저)
             try:
-                # 텍스트로 '외국인소진율'을 포함하는 th 찾기
                 foreign_th = soup.find('th', string=re.compile('외국인소진율'))
                 if foreign_th:
                     data['foreign_rate'] = foreign_th.find_next_sibling('td').text.strip()
             except: pass
 
-            # 52주 최고/최저
             try:
                 range_th = soup.find('th', string=re.compile('52주최고'))
                 if range_th:
@@ -123,25 +115,9 @@ def get_naver_stock_details(ticker):
                         data['low_52'] = em_tags[1].text.strip()
             except: pass
             
-            # BPS (PBR 옆에 있는 텍스트 파싱 시도)
-            # 네이버 구조상 PBR <td>...</td> BPS <td>...</td> 순서가 아님. 
-            # PBR 행의 다음 행이나 같은 행의 다른 셀을 찾아야 함. 
-            # 단순히 ID가 없는 경우를 대비해 soup text 검색보다는 투자지표 테이블 전체 파싱이 나을 수 있으나
-            # 간편하게 PBR/BPS 테이블 구조 활용
             try:
-                # 'PBR' 텍스트가 있는 th의 부모 tr 찾기
-                pbr_th = soup.find('th', string=re.compile('PBR'))
-                if pbr_th:
-                    # 그 줄의 td 내용 확인 (PBR 값)
-                    # BPS는 보통 그 옆이나 다음 줄. 네이버는 [PER | EPS], [PBR | BPS] 구조임
-                    # 따라서 PBR td 안에 BPS 정보도 있을 수 있음 (span구조)
-                    # 혹은 text parsing: "BPS" 텍스트를 찾아서
-                    pass 
-                
-                # BPS는 명시적 ID가 없으므로 html 구조상 추적 (table class per_table)
                 per_table = soup.select_one("table.per_table")
                 if per_table:
-                    # [PBR l BPS] row 찾기
                     rows = per_table.select("tr")
                     for r in rows:
                         if "BPS" in r.text:
@@ -306,7 +282,7 @@ def main():
             info = get_naver_stock_details(ticker)
             annual, quarter = get_financials_from_naver(ticker)
             
-            # --- 상단 상세 정보 패널 (네이버 금융 스타일) ---
+            # --- 상단 상세 정보 패널 ---
             st.markdown(f"### {info['name']} ({ticker})")
             
             # 가격 및 등락 표시
@@ -328,23 +304,84 @@ def main():
             </div>
             """, unsafe_allow_html=True)
             
-            # 상세 정보 그리드
-            # 1열: 시가총액, 외국인소진율, 52주최고
-            # 2열: PER/EPS, PBR/BPS, 배당수익률, 52주최저
-            
-            col_info1, col_info2, col_info3, col_info4 = st.columns(4)
-            with col_info1:
-                st.metric("시가총액", info['market_cap'])
-                st.metric("52주 최고", info['high_52'])
-            with col_info2:
-                st.metric("외국인소진율", info['foreign_rate'])
-                st.metric("52주 최저", info['low_52'])
-            with col_info3:
-                st.metric("PER", f"{info['per']} 배")
-                st.metric("EPS", f"{info['eps']} 원")
-            with col_info4:
-                st.metric("PBR", f"{info['pbr']} 배")
-                st.metric("배당수익률", f"{info['dvr']} %")
+            # --- 상세 정보 그리드 (CSS 커스텀 디자인) ---
+            # st.metric 대신 HTML/CSS Grid를 사용하여 폰트 크기 조정 및 잘림 방지
+            st.markdown("""
+            <style>
+            .stock-info-container {
+                display: grid;
+                grid-template-columns: repeat(4, 1fr);
+                gap: 8px;
+                margin-top: 10px;
+                margin-bottom: 20px;
+            }
+            @media (max-width: 600px) {
+                .stock-info-container {
+                    grid-template-columns: repeat(2, 1fr);
+                }
+            }
+            .stock-info-box {
+                background-color: rgba(128, 128, 128, 0.1);
+                padding: 10px;
+                border-radius: 5px;
+                text-align: center;
+            }
+            .stock-info-label {
+                font-size: 12px;
+                color: #666;
+                margin-bottom: 4px;
+            }
+            .stock-info-value {
+                font-size: 15px;
+                font-weight: bold;
+                color: #333;
+                white-space: nowrap; /* 줄바꿈 방지 */
+            }
+            /* 다크모드 대응 */
+            @media (prefers-color-scheme: dark) {
+                .stock-info-label { color: #aaa; }
+                .stock-info-value { color: #fff; }
+            }
+            </style>
+            """, unsafe_allow_html=True)
+
+            info_html = f"""
+            <div class="stock-info-container">
+                <div class="stock-info-box">
+                    <div class="stock-info-label">시가총액</div>
+                    <div class="stock-info-value">{info['market_cap']}</div>
+                </div>
+                <div class="stock-info-box">
+                    <div class="stock-info-label">외국인소진율</div>
+                    <div class="stock-info-value">{info['foreign_rate']}</div>
+                </div>
+                <div class="stock-info-box">
+                    <div class="stock-info-label">PER</div>
+                    <div class="stock-info-value">{info['per']} 배</div>
+                </div>
+                <div class="stock-info-box">
+                    <div class="stock-info-label">PBR</div>
+                    <div class="stock-info-value">{info['pbr']} 배</div>
+                </div>
+                <div class="stock-info-box">
+                    <div class="stock-info-label">52주 최고</div>
+                    <div class="stock-info-value">{info['high_52']}</div>
+                </div>
+                <div class="stock-info-box">
+                    <div class="stock-info-label">52주 최저</div>
+                    <div class="stock-info-value">{info['low_52']}</div>
+                </div>
+                <div class="stock-info-box">
+                    <div class="stock-info-label">EPS</div>
+                    <div class="stock-info-value">{info['eps']} 원</div>
+                </div>
+                <div class="stock-info-box">
+                    <div class="stock-info-label">배당수익률</div>
+                    <div class="stock-info-value">{info['dvr']} %</div>
+                </div>
+            </div>
+            """
+            st.markdown(info_html, unsafe_allow_html=True)
 
             with st.expander("기업 개요 보기"):
                 st.write(info['overview'])
