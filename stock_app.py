@@ -83,7 +83,7 @@ def get_naver_stock_details(ticker):
                     data['market_cap'] = mc_element.text.strip().replace('\t', '').replace('\n', '') + " 억원"
             except: pass
 
-            # 5. 투자정보
+            # 5. 투자정보 (PER, EPS, PBR, 배당수익률)
             try:
                 per_el = soup.select_one("#_per")
                 if per_el: data['per'] = per_el.text.strip()
@@ -98,23 +98,36 @@ def get_naver_stock_details(ticker):
                 if dvr_el: data['dvr'] = dvr_el.text.strip()
             except: pass
 
-            # 6. 기타 정보 (외국인소진율, 52주최고/최저)
+            # 6. 외국인소진율 (수정됨: table.lwidth 내에서 탐색)
             try:
-                foreign_th = soup.find('th', string=re.compile('외국인소진율'))
-                if foreign_th:
-                    data['foreign_rate'] = foreign_th.find_next_sibling('td').text.strip()
+                # 'lwidth' 클래스를 가진 테이블 안에서 '외국인소진율' 텍스트가 포함된 행 찾기
+                lwidth_table = soup.select_one("table.lwidth")
+                if lwidth_table:
+                    for tr in lwidth_table.select("tr"):
+                        if "외국인소진율" in tr.text:
+                            # 해당 행의 em 태그값 추출
+                            em = tr.select_one("td em")
+                            if em:
+                                data['foreign_rate'] = em.text.strip()
+                            break
             except: pass
 
+            # 7. 52주 최고/최저 (수정됨: table.rwidth 내에서 탐색)
             try:
-                range_th = soup.find('th', string=re.compile('52주최고'))
-                if range_th:
-                    range_td = range_th.find_next_sibling('td')
-                    em_tags = range_td.select('em')
-                    if len(em_tags) >= 2:
-                        data['high_52'] = em_tags[0].text.strip()
-                        data['low_52'] = em_tags[1].text.strip()
+                # 'rwidth' 클래스를 가진 테이블 안에서 '52주최고' 텍스트가 포함된 행 찾기
+                rwidth_table = soup.select_one("table.rwidth")
+                if rwidth_table:
+                    for tr in rwidth_table.select("tr"):
+                        if "52주최고" in tr.text:
+                            # 해당 행의 td 안에 있는 em 태그들 추출 (순서대로 최고, 최저)
+                            ems = tr.select("td em")
+                            if len(ems) >= 2:
+                                data['high_52'] = ems[0].text.strip()
+                                data['low_52'] = ems[1].text.strip()
+                            break
             except: pass
             
+            # 8. BPS (table.per_table 내에서 탐색)
             try:
                 per_table = soup.select_one("table.per_table")
                 if per_table:
@@ -122,7 +135,7 @@ def get_naver_stock_details(ticker):
                     for r in rows:
                         if "BPS" in r.text:
                             ems = r.select("em")
-                            if len(ems) >= 2:
+                            if len(ems) >= 2: # 보통 PBR 옆에 BPS가 위치함 (두 번째 em)
                                 data['bps'] = ems[1].text.strip()
                             break
             except: pass
