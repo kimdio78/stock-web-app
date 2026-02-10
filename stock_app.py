@@ -162,7 +162,7 @@ def get_investor_trend(ticker):
     except:
         return []
 
-# --- 동일업종 비교 크롤링 (텍스트 정제 기능 강화) ---
+# --- 동일업종 비교 크롤링 (색상 및 기호 처리 추가) ---
 def get_same_industry_comparison(ticker):
     try:
         url = f"https://finance.naver.com/item/main.naver?code={ticker}"
@@ -190,15 +190,30 @@ def get_same_industry_comparison(ticker):
                         row_val = []
                         # 첫번째 th는 항목명
                         th_item = tr.select_one("th")
+                        row_title = ""
                         if th_item:
-                            row_val.append(th_item.text.strip())
+                            row_title = th_item.text.strip()
+                            row_val.append(row_title)
                         
-                        # 나머지 td는 값 (여기서 텍스트 정제 수행)
+                        # 나머지 td는 값
                         for td in tr.select("td"):
                             raw_text = td.text.strip()
-                            # 1. 개행문자, 탭 제거 및 공백 하나로 통일
                             clean_text = re.sub(r'[\n\t]+', ' ', raw_text)
                             clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+                            
+                            # 등락 정보 스타일링 (전일대비, 등락률)
+                            if row_title in ["전일대비", "등락률"]:
+                                # 1. 숫자만 추출 (쉼표, 점, % 포함)
+                                val_text = re.sub(r'[^0-9.,%]', '', clean_text)
+                                
+                                # 2. 방향 판단 및 스타일 적용
+                                if "상향" in clean_text or "상승" in clean_text or "+" in clean_text:
+                                    clean_text = f'<span style="color:#d20000">+{val_text}</span>'
+                                elif "하향" in clean_text or "하락" in clean_text or "-" in clean_text:
+                                    clean_text = f'<span style="color:#0051c7">-{val_text}</span>'
+                                elif "보합" in clean_text:
+                                    clean_text = val_text
+                            
                             row_val.append(clean_text)
                         
                         if len(row_val) == len(headers):
@@ -354,7 +369,7 @@ def main():
             
             annual, quarter = get_financials_from_naver(ticker, curr_price, info.get('shares', 0))
             investor_trends = get_investor_trend(ticker)
-            industry_compare_df = get_same_industry_comparison(ticker) # 동일업종 비교
+            industry_compare_df = get_same_industry_comparison(ticker)
             
             # --- 상단 상세 정보 패널 ---
             st.markdown(f"### {info['name']} ({ticker})")
@@ -514,7 +529,7 @@ def main():
                         else: row.append(f"{val:,.0f}" if is_money else f"{val:,.2f}")
                     disp_annual.append(row)
                 df_annual = pd.DataFrame(disp_annual, columns=cols_annual)
-                html_annual = df_annual.to_html(index=False, border=0, classes='scroll-table-content')
+                html_annual = df_annual.to_html(index=False, border=0, classes='scroll-table-content', escape=False)
                 st.markdown(f'<div class="scroll-table">{html_annual}</div>', unsafe_allow_html=True)
 
             if quarter:
@@ -530,7 +545,7 @@ def main():
                         else: row.append(f"{val:,.0f}" if is_money else f"{val:,.2f}")
                     disp_quarter.append(row)
                 df_quarter = pd.DataFrame(disp_quarter, columns=cols_quarter)
-                html_quarter = df_quarter.to_html(index=False, border=0, classes='scroll-table-content')
+                html_quarter = df_quarter.to_html(index=False, border=0, classes='scroll-table-content', escape=False)
                 st.markdown(f'<div class="scroll-table">{html_quarter}</div>', unsafe_allow_html=True)
 
             if not annual and not quarter:
@@ -539,7 +554,7 @@ def main():
             # --- 신규 추가: 동일업종 비교 ---
             if not industry_compare_df.empty:
                 st.markdown("### 👯 동일업종 비교")
-                html_compare = industry_compare_df.to_html(index=False, border=0, classes='scroll-table-content')
+                html_compare = industry_compare_df.to_html(index=False, border=0, classes='scroll-table-content', escape=False)
                 st.markdown(f'<div class="scroll-table">{html_compare}</div>', unsafe_allow_html=True)
 
             st.divider()
