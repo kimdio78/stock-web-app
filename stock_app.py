@@ -28,11 +28,15 @@ def load_stock_data():
     return [], {}, {}
 
 def get_naver_stock_details(ticker):
+    """
+    네이버 금융 메인 페이지에서 상세 주가 정보를 크롤링합니다.
+    """
     try:
         url = f"https://finance.naver.com/item/main.naver?code={ticker}"
         headers = {'User-Agent': 'Mozilla/5.0'}
         response = requests.get(url, headers=headers, verify=False, timeout=10)
         
+        # 기본값 초기화
         data = {
             'name': ticker, 'overview': "정보 없음", 
             'now_price': '0', 'diff_rate': '0.00', 'diff_amount': '0', 'direction': 'flat',
@@ -44,14 +48,17 @@ def get_naver_stock_details(ticker):
         if response.status_code == 200:
             soup = BeautifulSoup(response.text, 'html.parser')
             
+            # 1. 종목명
             name_tag = soup.select_one(".wrap_company h2 a")
             if name_tag:
                 data['name'] = name_tag.text.strip()
 
+            # 2. 기업 개요
             overview_div = soup.select_one("#summary_info")
             if overview_div:
                 data['overview'] = "\n ".join([p.text.strip() for p in overview_div.select("p") if p.text.strip()])
 
+            # 3. 현재가 및 등락률
             try:
                 now_tag = soup.select_one(".no_today .blind")
                 if now_tag: data['now_price'] = now_tag.text.strip()
@@ -69,42 +76,54 @@ def get_naver_stock_details(ticker):
                     elif exday_tag.select_one(".ico.lower"): data['direction'] = 'lower'
             except: pass
 
+            # 4. 시가총액
             try:
                 mc_element = soup.select_one("#_market_sum")
                 if mc_element:
                     data['market_cap'] = mc_element.text.strip().replace('\t', '').replace('\n', '') + " 억원"
             except: pass
 
+            # 5. 투자정보
             try:
                 per_el = soup.select_one("#_per")
                 if per_el: data['per'] = per_el.text.strip()
+                
                 eps_el = soup.select_one("#_eps")
                 if eps_el: data['eps'] = eps_el.text.strip()
+                
                 pbr_el = soup.select_one("#_pbr")
                 if pbr_el: data['pbr'] = pbr_el.text.strip()
+                
                 dvr_el = soup.select_one("#_dvr")
                 if dvr_el: data['dvr'] = dvr_el.text.strip()
             except: pass
 
+            # 6. 기타 정보 (외국인소진율, 52주최고/최저)
             try:
-                lwidth_table = soup.select_one("table.lwidth")
-                if lwidth_table:
-                    for tr in lwidth_table.select("tr"):
-                        if "외국인소진율" in tr.text:
-                            em = tr.select_one("td em")
-                            if em: data['foreign_rate'] = em.text.strip()
-                            break
+                foreign_th = soup.find('th', string=re.compile('외국인소진율'))
+                if foreign_th:
+                    data['foreign_rate'] = foreign_th.find_next_sibling('td').text.strip()
             except: pass
 
             try:
-                rwidth_table = soup.select_one("table.rwidth")
-                if rwidth_table:
-                    for tr in rwidth_table.select("tr"):
-                        if "52주최고" in tr.text:
-                            ems = tr.select("td em")
+                range_th = soup.find('th', string=re.compile('52주최고'))
+                if range_th:
+                    range_td = range_th.find_next_sibling('td')
+                    em_tags = range_td.select('em')
+                    if len(em_tags) >= 2:
+                        data['high_52'] = em_tags[0].text.strip()
+                        data['low_52'] = em_tags[1].text.strip()
+            except: pass
+            
+            try:
+                per_table = soup.select_one("table.per_table")
+                if per_table:
+                    rows = per_table.select("tr")
+                    for r in rows:
+                        if "BPS" in r.text:
+                            ems = r.select("em")
                             if len(ems) >= 2:
-                                data['high_52'] = ems[0].text.strip()
-                                data['low_52'] = ems[1].text.strip()
+                                data['bps'] = ems[1].text.strip()
                             break
             except: pass
 
@@ -301,19 +320,22 @@ def main():
 
     if ticker:
         try:
+            # 1. 상세 정보 크롤링 (네이버)
             info = get_naver_stock_details(ticker)
             annual, quarter = get_financials_from_naver(ticker)
             investor_trends = get_investor_trend(ticker) # 투자자 동향 데이터
             
+            # --- 상단 상세 정보 패널 ---
             st.markdown(f"### {info['name']} ({ticker})")
             
+            # 가격 및 등락 표시
             diff_color = "black"
             diff_arrow = ""
             if info['direction'] in ['up', 'upper']:
-                diff_color = "#d20000"
+                diff_color = "#d20000" # 빨강
                 diff_arrow = "▲"
             elif info['direction'] in ['down', 'lower']:
-                diff_color = "#0051c7"
+                diff_color = "#0051c7" # 파랑
                 diff_arrow = "▼"
             
             st.markdown(f"""
@@ -325,27 +347,81 @@ def main():
             </div>
             """, unsafe_allow_html=True)
             
+            # --- 상세 정보 그리드 (CSS 커스텀 디자인) ---
+            # st.metric 대신 HTML/CSS Grid를 사용하여 폰트 크기 조정 및 잘림 방지
             st.markdown("""
             <style>
-            .stock-info-container { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 10px; margin-bottom: 20px; }
-            @media (max-width: 600px) { .stock-info-container { grid-template-columns: repeat(2, 1fr); } }
-            .stock-info-box { background-color: rgba(128, 128, 128, 0.1); padding: 10px; border-radius: 5px; text-align: center; }
-            .stock-info-label { font-size: 12px; color: #666; margin-bottom: 4px; }
-            .stock-info-value { font-size: 15px; font-weight: bold; color: #333; white-space: nowrap; }
-            @media (prefers-color-scheme: dark) { .stock-info-label { color: #aaa; } .stock-info-value { color: #fff; } }
+            .stock-info-container {
+                display: grid;
+                grid-template-columns: repeat(4, 1fr);
+                gap: 8px;
+                margin-top: 10px;
+                margin-bottom: 20px;
+            }
+            @media (max-width: 600px) {
+                .stock-info-container {
+                    grid-template-columns: repeat(2, 1fr);
+                }
+            }
+            .stock-info-box {
+                background-color: rgba(128, 128, 128, 0.1);
+                padding: 10px;
+                border-radius: 5px;
+                text-align: center;
+            }
+            .stock-info-label {
+                font-size: 12px;
+                color: #666;
+                margin-bottom: 4px;
+            }
+            .stock-info-value {
+                font-size: 15px;
+                font-weight: bold;
+                color: #333;
+                white-space: nowrap; /* 줄바꿈 방지 */
+            }
+            /* 다크모드 대응 */
+            @media (prefers-color-scheme: dark) {
+                .stock-info-label { color: #aaa; }
+                .stock-info-value { color: #fff; }
+            }
             </style>
             """, unsafe_allow_html=True)
 
             info_html = f"""
             <div class="stock-info-container">
-                <div class="stock-info-box"><div class="stock-info-label">시가총액</div><div class="stock-info-value">{info['market_cap']}</div></div>
-                <div class="stock-info-box"><div class="stock-info-label">외국인소진율</div><div class="stock-info-value">{info['foreign_rate']}</div></div>
-                <div class="stock-info-box"><div class="stock-info-label">PER</div><div class="stock-info-value">{info['per']} 배</div></div>
-                <div class="stock-info-box"><div class="stock-info-label">PBR</div><div class="stock-info-value">{info['pbr']} 배</div></div>
-                <div class="stock-info-box"><div class="stock-info-label">52주 최고</div><div class="stock-info-value">{info['high_52']}</div></div>
-                <div class="stock-info-box"><div class="stock-info-label">52주 최저</div><div class="stock-info-value">{info['low_52']}</div></div>
-                <div class="stock-info-box"><div class="stock-info-label">EPS</div><div class="stock-info-value">{info['eps']} 원</div></div>
-                <div class="stock-info-box"><div class="stock-info-label">배당수익률</div><div class="stock-info-value">{info['dvr']} %</div></div>
+                <div class="stock-info-box">
+                    <div class="stock-info-label">시가총액</div>
+                    <div class="stock-info-value">{info['market_cap']}</div>
+                </div>
+                <div class="stock-info-box">
+                    <div class="stock-info-label">외국인소진율</div>
+                    <div class="stock-info-value">{info['foreign_rate']}</div>
+                </div>
+                <div class="stock-info-box">
+                    <div class="stock-info-label">PER</div>
+                    <div class="stock-info-value">{info['per']} 배</div>
+                </div>
+                <div class="stock-info-box">
+                    <div class="stock-info-label">PBR</div>
+                    <div class="stock-info-value">{info['pbr']} 배</div>
+                </div>
+                <div class="stock-info-box">
+                    <div class="stock-info-label">52주 최고</div>
+                    <div class="stock-info-value">{info['high_52']}</div>
+                </div>
+                <div class="stock-info-box">
+                    <div class="stock-info-label">52주 최저</div>
+                    <div class="stock-info-value">{info['low_52']}</div>
+                </div>
+                <div class="stock-info-box">
+                    <div class="stock-info-label">EPS</div>
+                    <div class="stock-info-value">{info['eps']} 원</div>
+                </div>
+                <div class="stock-info-box">
+                    <div class="stock-info-label">배당수익률</div>
+                    <div class="stock-info-value">{info['dvr']} %</div>
+                </div>
             </div>
             """
             st.markdown(info_html, unsafe_allow_html=True)
@@ -353,6 +429,7 @@ def main():
             with st.expander("기업 개요 보기"):
                 st.write(info['overview'])
 
+            # 차트 링크
             st.markdown(f"""
                 <a href="https://m.stock.naver.com/item/main.nhn?code={ticker}#/chart" target="_blank" style="text-decoration:none;">
                     <div style="background-color:#03C75A; color:white; padding:12px; border-radius:8px; text-align:center; font-weight:bold; margin: 15px 0;">
@@ -361,6 +438,7 @@ def main():
                 </a>
                 """, unsafe_allow_html=True)
             
+            # 차트 이미지
             t_stamp = int(time.time())
             tab_d, tab_w, tab_m = st.tabs(["일봉", "주봉", "월봉"])
             with tab_d: st.image(f"https://ssl.pstatic.net/imgfinance/chart/item/candle/day/{ticker}.png?t={t_stamp}", use_container_width=True)
@@ -392,12 +470,15 @@ def main():
                 
                 for row in investor_trends:
                     # 기관 색상
-                    inst_val = int(row['기관'].replace(',', ''))
+                    # '+' 기호 제거 후 처리 (기존에 중복된 + 기호 제거)
+                    inst_val_str = row['기관'].replace('+', '').replace(',', '')
+                    inst_val = int(inst_val_str)
                     inst_color = "text-red" if inst_val > 0 else "text-blue" if inst_val < 0 else "text-black"
                     inst_prefix = "+" if inst_val > 0 else ""
                     
                     # 외국인 색상
-                    frgn_val = int(row['외국인'].replace(',', ''))
+                    frgn_val_str = row['외국인'].replace('+', '').replace(',', '')
+                    frgn_val = int(frgn_val_str)
                     frgn_color = "text-red" if frgn_val > 0 else "text-blue" if frgn_val < 0 else "text-black"
                     frgn_prefix = "+" if frgn_val > 0 else ""
                     
@@ -410,8 +491,8 @@ def main():
                         <td style="text-align:center;">{row['날짜']}</td>
                         <td>{row['종가']}</td>
                         <td class="{rate_color}">{row['등락률']}</td>
-                        <td class="{inst_color}">{inst_prefix}{row['기관']}</td>
-                        <td class="{frgn_color}">{frgn_prefix}{row['외국인']}</td>
+                        <td class="{inst_color}">{inst_prefix}{abs(inst_val):,}</td>
+                        <td class="{frgn_color}">{frgn_prefix}{abs(frgn_val):,}</td>
                     </tr>
                     """
                 trend_html += "</tbody></table></div>"
