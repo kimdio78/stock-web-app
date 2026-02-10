@@ -30,7 +30,6 @@ def load_stock_data():
 def get_naver_stock_details(ticker):
     """
     네이버 금융 메인 페이지에서 상세 주가 정보를 크롤링합니다.
-    (개선된 로직: 특정 클래스 대신 텍스트 매칭으로 데이터 탐색)
     """
     try:
         url = f"https://finance.naver.com/item/main.naver?code={ticker}"
@@ -49,17 +48,14 @@ def get_naver_stock_details(ticker):
         if response.status_code == 200:
             soup = BeautifulSoup(response.text, 'html.parser')
             
-            # 1. 종목명
             name_tag = soup.select_one(".wrap_company h2 a")
             if name_tag:
                 data['name'] = name_tag.text.strip()
 
-            # 2. 기업 개요
             overview_div = soup.select_one("#summary_info")
             if overview_div:
                 data['overview'] = "\n ".join([p.text.strip() for p in overview_div.select("p") if p.text.strip()])
 
-            # 3. 현재가 및 등락률
             try:
                 now_tag = soup.select_one(".no_today .blind")
                 if now_tag: data['now_price'] = now_tag.text.strip()
@@ -77,14 +73,13 @@ def get_naver_stock_details(ticker):
                     elif exday_tag.select_one(".ico.lower"): data['direction'] = 'lower'
             except: pass
 
-            # 4. 시가총액
             try:
                 mc_element = soup.select_one("#_market_sum")
                 if mc_element:
                     data['market_cap'] = mc_element.text.strip().replace('\t', '').replace('\n', '') + " 억원"
             except: pass
 
-            # 5. 투자정보 (ID 기반)
+            # ID 기반 데이터 추출
             try:
                 per_el = soup.select_one("#_per")
                 if per_el: data['per'] = per_el.text.strip()
@@ -96,20 +91,15 @@ def get_naver_stock_details(ticker):
                 if dvr_el: data['dvr'] = dvr_el.text.strip()
             except: pass
 
-            # 6. 테이블 전체 탐색 (외국인소진율, 52주최고/최저, BPS 등)
-            # 특정 ID나 클래스가 없는 경우 <th> 태그의 텍스트를 전수 조사하여 매칭
+            # 텍스트 매칭 기반 데이터 추출 (외국인소진율, 52주 등)
             all_ths = soup.select("th")
             for th in all_ths:
                 th_text = th.text.strip()
-                
-                # 외국인 소진율
                 if "외국인소진율" in th_text:
                     td = th.find_next_sibling("td")
                     if td:
                         em = td.select_one("em")
                         data['foreign_rate'] = em.text.strip() if em else td.text.strip()
-                
-                # 52주 최고/최저 (보통 <td> 안에 <em>최고</em> l <em>최저</em> 구조)
                 elif "52주최고" in th_text:
                     td = th.find_next_sibling("td")
                     if td:
@@ -117,15 +107,12 @@ def get_naver_stock_details(ticker):
                         if len(ems) >= 2:
                             data['high_52'] = ems[0].text.strip()
                             data['low_52'] = ems[1].text.strip()
-                
-                # BPS (PBR 근처에 없거나 별도 행일 수 있음)
-                elif "BPS" in th_text and "PBR" not in th_text: # PBR 헤더와 겹치지 않게
+                elif "BPS" in th_text and "PBR" not in th_text:
                     td = th.find_next_sibling("td")
                     if td:
                         em = td.select_one("em")
                         data['bps'] = em.text.strip() if em else td.text.strip()
             
-            # BPS 보완 (table.per_table 구조 활용)
             if data['bps'] == '-':
                 try:
                     per_table = soup.select_one("table.per_table")
@@ -134,11 +121,8 @@ def get_naver_stock_details(ticker):
                         for r in rows:
                             if "BPS" in r.text:
                                 ems = r.select("em")
-                                # 보통 두 번째 em이 BPS 값
-                                if len(ems) >= 2:
-                                    data['bps'] = ems[1].text.strip()
-                                elif len(ems) == 1:
-                                    data['bps'] = ems[0].text.strip()
+                                if len(ems) >= 2: data['bps'] = ems[1].text.strip()
+                                elif len(ems) == 1: data['bps'] = ems[0].text.strip()
                 except: pass
 
         return data
@@ -164,8 +148,6 @@ def get_investor_trend(ticker):
                 
                 for row in rows:
                     cols = row.select("td")
-                    # 유효한 데이터 행은 td가 9개임 
-                    # 0:날짜, 1:종가, 2:전일비, 3:등락률, 4:거래량, 5:기관순매매, 6:외국인순매매, 7:보유주수, 8:보유율
                     if len(cols) == 9:
                         date = cols[0].text.strip()
                         close = cols[1].text.strip()
@@ -183,7 +165,7 @@ def get_investor_trend(ticker):
                             "보유율": hold_rate
                         })
                         
-                        if len(trends) >= 10: # 최근 10일치만 수집
+                        if len(trends) >= 10: 
                             break
         return trends
     except:
@@ -340,10 +322,12 @@ def main():
 
     if ticker:
         try:
+            # 1. 상세 정보 크롤링
             info = get_naver_stock_details(ticker)
             annual, quarter = get_financials_from_naver(ticker)
             investor_trends = get_investor_trend(ticker)
             
+            # --- 상단 상세 정보 패널 ---
             st.markdown(f"### {info['name']} ({ticker})")
             
             diff_color = "black"
@@ -410,25 +394,21 @@ def main():
             if investor_trends:
                 st.markdown("### 🏢 외국인/기관 매매동향 (최근 10일)")
                 
-                # 1. 합계 계산
                 total_inst = 0
                 total_frgn = 0
                 for row in investor_trends:
-                    try:
-                        total_inst += int(row['기관'].replace('+', '').replace(',', ''))
+                    try: total_inst += int(row['기관'].replace('+', '').replace(',', ''))
                     except: pass
-                    try:
-                        total_frgn += int(row['외국인'].replace('+', '').replace(',', ''))
+                    try: total_frgn += int(row['외국인'].replace('+', '').replace(',', ''))
                     except: pass
                 
-                # 2. 합계 행 스타일링
                 t_inst_color = "text-red" if total_inst > 0 else "text-blue" if total_inst < 0 else "text-black"
                 t_inst_prefix = "+" if total_inst > 0 else ""
                 t_frgn_color = "text-red" if total_frgn > 0 else "text-blue" if total_frgn < 0 else "text-black"
                 t_frgn_prefix = "+" if total_frgn > 0 else ""
 
-                trend_html = """
-<style>
+                # --- 수정된 HTML 생성 부분 (들여쓰기 제거) ---
+                trend_html = """<style>
 .trend-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin-bottom: 20px; }
 .trend-table th { background-color: rgba(128,128,128,0.1); text-align: center; padding: 6px; border-bottom: 1px solid rgba(128,128,128,0.2); }
 .trend-table td { text-align: right; padding: 6px; border-bottom: 1px solid rgba(128,128,128,0.2); }
@@ -443,33 +423,21 @@ def main():
 <thead><tr><th>날짜</th><th>종가</th><th>등락률</th><th>기관</th><th>외국인</th><th>보유율</th></tr></thead>
 <tbody>
 """
-                # 합계 행 추가
-                trend_html += f"""
-                <tr class="total-row">
-                    <td style="text-align:center;">10일 합계</td>
-                    <td colspan="2" style="text-align:center;">-</td>
-                    <td class="{t_inst_color}">{t_inst_prefix}{total_inst:,}</td>
-                    <td class="{t_frgn_color}">{t_frgn_prefix}{total_frgn:,}</td>
-                    <td>-</td>
-                </tr>
-                """
+                trend_html += f"""<tr class="total-row"><td style="text-align:center;">10일 합계</td><td colspan="2" style="text-align:center;">-</td><td class="{t_inst_color}">{t_inst_prefix}{total_inst:,}</td><td class="{t_frgn_color}">{t_frgn_prefix}{total_frgn:,}</td><td>-</td></tr>"""
 
                 for row in investor_trends:
-                    # 기관
                     inst_val_str = row['기관'].replace('+', '').replace(',', '')
                     try: inst_val = int(inst_val_str)
                     except: inst_val = 0
                     inst_color = "text-red" if inst_val > 0 else "text-blue" if inst_val < 0 else "text-black"
                     inst_prefix = "+" if inst_val > 0 else ""
                     
-                    # 외국인
                     frgn_val_str = row['외국인'].replace('+', '').replace(',', '')
                     try: frgn_val = int(frgn_val_str)
                     except: frgn_val = 0
                     frgn_color = "text-red" if frgn_val > 0 else "text-blue" if frgn_val < 0 else "text-black"
                     frgn_prefix = "+" if frgn_val > 0 else ""
                     
-                    # 등락률
                     try: rate_val = float(row['등락률'].replace('%', ''))
                     except: rate_val = 0.0
                     rate_color = "text-red" if rate_val > 0 else "text-blue" if rate_val < 0 else "text-black"
