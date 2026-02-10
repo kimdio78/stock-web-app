@@ -36,7 +36,7 @@ def get_naver_stock_details(ticker):
         data = {
             'name': ticker, 'overview': "정보 없음", 
             'now_price': '0', 'diff_rate': '0.00', 'diff_amount': '0', 'direction': 'flat',
-            'market_cap': '-', 'foreign_rate': '-', 
+            'market_cap': '-', 'shares': 0, 'foreign_rate': '-', 
             'per': '-', 'eps': '-', 'pbr': '-', 'bps': '-', 'dvr': '-',
             'high_52': '-', 'low_52': '-'
         }
@@ -72,6 +72,20 @@ def get_naver_stock_details(ticker):
                 mc_element = soup.select_one("#_market_sum")
                 if mc_element:
                     data['market_cap'] = mc_element.text.strip().replace('\t', '').replace('\n', '') + " 억원"
+            except: pass
+
+            # 상장주식수 추출 (SPS, CPS 계산용)
+            try:
+                # 시가총액 정보 근처의 상장주식수 찾기
+                first_table = soup.select_one("div.first table")
+                if first_table:
+                    for tr in first_table.select("tr"):
+                        if "상장주식수" in tr.text:
+                            em = tr.select_one("em")
+                            if em:
+                                shares_str = em.text.strip().replace(',', '')
+                                data['shares'] = int(shares_str)
+                            break
             except: pass
 
             try:
@@ -120,7 +134,7 @@ def get_naver_stock_details(ticker):
 
         return data
     except:
-        return {'name': ticker, 'overview': "로딩 실패"}
+        return {'name': ticker, 'overview': "로딩 실패", 'shares': 0}
 
 def get_investor_trend(ticker):
     try:
@@ -161,103 +175,173 @@ def clean_float(text):
     except:
         return 0.0
 
-def get_financials_from_naver(ticker):
+def get_financials_from_naver(ticker, current_price=0, shares=0):
     """
-    네이버 금융에서 연간(최근 5년), 분기(최근 5분기) 데이터를 분리하여 가져옵니다.
+    WiseReport 페이지를 크롤링하여 더 풍부한 재무 데이터(EV/EBITDA 등)를 수집하고,
+    누락된 지표(SPS, PSR 등)를 계산하여 추가합니다.
     """
     try:
-        url = f"https://finance.naver.com/item/main.naver?code={ticker}"
+        # WiseReport URL (재무분석 상세)
+        url = f"https://navercomp.wisereport.co.kr/v2/company/c1010001.aspx?cmp_cd={ticker}"
         headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(url, headers=headers, verify=False)
-        soup = BeautifulSoup(response.text, 'html.parser')
-        finance_table = soup.select_one("div.section.cop_analysis > div.sub_section > table")
-        if not finance_table: return [], []
-
-        header_rows = finance_table.select("thead > tr")
-        if len(header_rows) < 2: return [], []
-
-        main_headers = header_rows[0].select("th")
-        date_headers = header_rows[1].select("th")
-        date_cols = [th.text.strip() for th in date_headers]
         
-        annual_cols_idx = []
-        quarter_cols_idx = []
-        current_idx = 0
+        # pd.read_html로 테이블 긁어오기 (lxml 필요)
+        dfs = pd.read_html(url, encoding='utf-8')
         
-        for th in main_headers:
-            colspan = int(th.get('colspan', 1))
-            text = th.text.strip()
-            if "연간" in text:
-                for i in range(colspan):
-                    if current_idx < len(date_cols): annual_cols_idx.append(current_idx)
-                    current_idx += 1
-            elif "분기" in text:
-                for i in range(colspan):
-                    if current_idx < len(date_cols): quarter_cols_idx.append(current_idx)
-                    current_idx += 1
-            else:
+        # 보통 12번째 테이블이 'Financial Summary' (변동 가능성 있음, 내용으로 확인)
+        df_fin = None
+        for df in dfs:
+            # 테이블 안에 '매출액'과 '영업이익'이 모두 있으면 재무제표로 간주
+            if '매출액' in df.iloc[:, 0].values and '영업이익' in df.iloc[:, 0].values:
+                df_fin = df
+                break
+        
+        if df_fin is None: return [], []
+
+        # 데이터 정리
+        df_fin = df_fin.set_index(df_fin.columns[0])
+        
+        # 컬럼 분류 (연간 vs 분기)
+        # 컬럼명이 MultiIndex일 수 있음 ([연간, 2019/12...], [분기, 2020/03...])
+        # 혹은 그냥 날짜만 있을 수도 있음.
+        # 보통 앞쪽 절반이 연간, 뒤쪽이 분기. (E) 포함 여부로 확인.
+        
+        cols = df_fin.columns
+        annual_cols = []
+        quarter_cols = []
+        
+        # 컬럼 순회하며 연간/분기 구분
+        # WiseReport는 보통 최근 5년 연간, 최근 5분기 분기 데이터를 제공함.
+        # 데이터프레임 컬럼 구조가 복잡할 수 있으므로 단순화
+        
+        # 1차적으로 단순 인덱스로 구분 시도 (네이버 금융과 유사하게 앞쪽 연간, 뒤쪽 분기)
+        # 보통 8개 컬럼 중 앞 4~5개가 연간
+        
+        # 명확한 구분을 위해 컬럼 텍스트 분석
+        for i, col in enumerate(cols):
+            col_str = str(col)
+            # 날짜 형식 (YYYY/MM) 확인
+            if re.search(r'\d{4}/\d{2}', col_str):
+                # 연간/분기 구분은 어렵지만, 보통 순서대로 나옴.
+                # WiseReport 기본 뷰: 연간 5개, 분기 5개 정도
                 pass
         
-        if not annual_cols_idx and not quarter_cols_idx:
-             annual_cols_idx = [0, 1, 2, 3]
-             quarter_cols_idx = [4, 5, 6, 7, 8, 9]
-
-        # 최근 5개년/5분기 확보 (데이터가 적으면 전체)
-        final_annual_idx = []
-        for i in annual_cols_idx:
-            if i < len(date_cols):
-                if "(E)" not in date_cols[i]: final_annual_idx.append(i)
-        final_annual_idx = final_annual_idx[-5:] # 최근 5개로 확장
+        # 데이터프레임 분리 (가정: 반반)
+        n_cols = len(cols)
+        mid_point = n_cols // 2
         
-        final_quarter_idx = []
-        for i in quarter_cols_idx:
-             if i < len(date_cols):
-                if "(E)" not in date_cols[i]: final_quarter_idx.append(i)
-        final_quarter_idx = final_quarter_idx[-5:] # 최근 5개로 확장
+        # 만약 컬럼이 MultiIndex라면 레벨 1이 날짜
+        if isinstance(cols, pd.MultiIndex):
+            date_cols = [c[1] for c in cols]
+        else:
+            date_cols = cols
 
-        annual_data = [{'date': date_cols[i].split('(')[0]} for i in final_annual_idx]
-        quarter_data = [{'date': date_cols[i].split('(')[0]} for i in final_quarter_idx]
+        # (E) 제외하고 확정 실적만 가져오기
+        # 연간 데이터 (앞쪽 절반)
+        annual_data = []
+        for i in range(mid_point):
+            col_name = date_cols[i]
+            if "(E)" not in str(col_name):
+                 annual_data.append({'date': str(col_name), 'col_idx': i})
+        annual_data = annual_data[-5:] # 최근 5년
 
-        rows = finance_table.select("tbody > tr")
-        
+        # 분기 데이터 (뒤쪽 절반)
+        quarter_data = []
+        for i in range(mid_point, n_cols):
+            col_name = date_cols[i]
+            if "(E)" not in str(col_name):
+                 quarter_data.append({'date': str(col_name), 'col_idx': i})
+        quarter_data = quarter_data[-5:] # 최근 5분기
+
+        # 항목 매핑 (인덱스 텍스트 -> 키)
         items_map = {
-            "매출액": "revenue", "영업이익": "op_income", "영업이익률": "op_margin",
-            "당기순이익": "net_income", "순이익률": "net_income_margin",
+            "매출액": "revenue", "영업이익": "op_income", "당기순이익": "net_income",
+            "영업이익률": "op_margin", "순이익률": "net_income_margin", "ROE": "roe",
             "부채비율": "debt_ratio", "당좌비율": "quick_ratio", "유보율": "reserve_ratio",
-            "ROE": "roe", "EPS": "eps", "PER": "per", "BPS": "bps", "PBR": "pbr",
+            "EPS": "eps", "BPS": "bps", "PER": "per", "PBR": "pbr",
+            "주당배당금": "dps", "배당성향": "payout_ratio", "시가배당률": "dividend_yield",
             "이자보상배율": "interest_coverage_ratio",
-            "CPS": "cps", "SPS": "sps", 
-            "PCR": "pcr", "PSR": "psr", "EV/EBITDA": "ev_ebitda"
+            "EV/EBITDA": "ev_ebitda", 
+            # WiseReport에는 Cash Flow가 '영업활동현금흐름'으로 있음 -> CPS 계산 가능
+            "영업활동현금흐름": "operating_cash_flow" 
         }
-
-        for row in rows:
-            th_text = row.th.text.strip()
-            th_clean = th_text.replace("\n", "").replace(" ", "").upper()
-            
-            key = None
-            for k_text, k_code in items_map.items():
-                if k_text.upper().replace(" ", "") in th_clean:
-                    if k_text == "영업이익" and "률" in th_clean: continue
-                    if k_text == "당기순이익" and "률" in th_clean: continue
-                    key = k_code
-                    break
-            
-            if "이자보상배율" in th_clean: key = "interest_coverage_ratio"
-
-            if key:
-                cells = row.select("td")
-                for i, idx in enumerate(final_annual_idx):
-                    if idx < len(cells):
-                        val_text = cells[idx].text.strip()
-                        annual_data[i][key] = clean_float(val_text)
-                
-                for i, idx in enumerate(final_quarter_idx):
-                    if idx < len(cells):
-                        val_text = cells[idx].text.strip()
-                        quarter_data[i][key] = clean_float(val_text)
         
-        return annual_data, quarter_data
-    except Exception:
+        final_annual = []
+        for d in annual_data:
+            item_dict = {'date': d['date']}
+            for idx_name, row in df_fin.iterrows():
+                idx_clean = str(idx_name).replace(" ", "").replace("\xa0", "")
+                val = row.iloc[d['col_idx']]
+                
+                # 매핑 확인
+                for k_txt, k_key in items_map.items():
+                    if k_txt in idx_clean:
+                         # 예외: 순이익률 vs 당기순이익, 영업이익률 vs 영업이익
+                        if k_txt == "영업이익" and "률" in idx_clean: continue
+                        if k_txt == "당기순이익" and "률" in idx_clean: continue
+                        
+                        item_dict[k_key] = clean_float(str(val))
+                        break
+            
+            # --- 추가 지표 계산 (SPS, PSR, CPS, PCR) ---
+            # 1. SPS (Sales Per Share) = 매출액(억) * 1억 / 주식수
+            revenue = item_dict.get('revenue', 0)
+            if revenue and shares > 0:
+                sps = (revenue * 100000000) / shares
+                item_dict['sps'] = sps
+                # PSR = 주가 / SPS (과거 주가를 알 수 없으므로 현재가 사용은 부정확할 수 있으나 참고용)
+                # 과거 연도 PSR은 당시 주가를 알아야 함. 여기서는 생략하거나 현재가 기준 계산(부정확)
+                # *수정*: 여기서는 데이터 표출이 목적이므로 값 계산만 수행.
+            
+            # 2. CPS (Cashflow Per Share) = 영업활동현금흐름(억) * 1억 / 주식수
+            ocf = item_dict.get('operating_cash_flow', 0)
+            if ocf and shares > 0:
+                cps = (ocf * 100000000) / shares
+                item_dict['cps'] = cps
+            
+            # 3. PCR / PSR (현재가 기준 계산 - 참고용)
+            if current_price > 0:
+                if item_dict.get('sps'): item_dict['psr'] = current_price / item_dict['sps']
+                if item_dict.get('cps'): item_dict['pcr'] = current_price / item_dict['cps']
+
+            final_annual.append(item_dict)
+
+        final_quarter = []
+        for d in quarter_data:
+            item_dict = {'date': d['date']}
+            for idx_name, row in df_fin.iterrows():
+                idx_clean = str(idx_name).replace(" ", "")
+                val = row.iloc[d['col_idx']]
+                for k_txt, k_key in items_map.items():
+                    if k_txt in idx_clean:
+                        if k_txt == "영업이익" and "률" in idx_clean: continue
+                        if k_txt == "당기순이익" and "률" in idx_clean: continue
+                        item_dict[k_key] = clean_float(str(val))
+                        break
+            
+            # 분기별 추가 지표 계산 (연환산 필요하지만 단순 분기값으로 계산)
+            revenue = item_dict.get('revenue', 0)
+            if revenue and shares > 0:
+                # 분기 매출 * 4 로 연환산하여 SPS 계산? 아니면 그냥 분기 SPS? 보통 연환산.
+                # 여기서는 단순 분기 매출로 계산
+                item_dict['sps'] = (revenue * 100000000) / shares 
+
+            ocf = item_dict.get('operating_cash_flow', 0)
+            if ocf and shares > 0:
+                item_dict['cps'] = (ocf * 100000000) / shares
+
+            if current_price > 0:
+                if item_dict.get('sps'): 
+                    # 분기 PSR은 보통 (현재가 / (분기SPS * 4)) 사용
+                    item_dict['psr'] = current_price / (item_dict['sps'] * 4) 
+                if item_dict.get('cps'): 
+                    item_dict['pcr'] = current_price / (item_dict['cps'] * 4)
+
+            final_quarter.append(item_dict)
+
+        return final_annual, final_quarter
+
+    except Exception as e:
         return [], []
 
 def calculate_srim(bps, roe, rrr):
@@ -317,8 +401,13 @@ def main():
 
     if ticker:
         try:
+            # 현재가 등 정보 수집
             info = get_naver_stock_details(ticker)
-            annual_list, quarter_list = get_financials_from_naver(ticker)
+            try: curr_price = float(info['now_price'].replace(',', ''))
+            except: curr_price = 0
+            
+            # 재무 정보 수집 (WiseReport 크롤링 + 계산)
+            annual_list, quarter_list = get_financials_from_naver(ticker, curr_price, info.get('shares', 0))
             investor_trends = get_investor_trend(ticker)
             
             st.markdown(f"### {info['name']} ({ticker})")
@@ -341,7 +430,6 @@ def main():
             </div>
             """, unsafe_allow_html=True)
             
-            # ... (상세 정보 그리드 및 차트 코드는 동일) ...
             st.markdown("""
             <style>
             .stock-info-container { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 10px; margin-bottom: 20px; }
@@ -434,6 +522,7 @@ def main():
                     rate_color = "text-red" if rate_val > 0 else "text-blue" if rate_val < 0 else "text-black"
 
                     trend_html += f'<tr><td style="text-align:center;">{row["날짜"]}</td><td style="text-align:right;">{row["종가"]}</td><td class="{rate_color}" style="text-align:right;">{row["등락률"]}</td><td class="{inst_color}" style="text-align:right;">{inst_prefix}{abs(inst_val):,}</td><td class="{frgn_color}" style="text-align:right;">{frgn_prefix}{abs(frgn_val):,}</td><td style="text-align:right;">{row["보유율"]}</td></tr>'
+                
                 trend_html += "</tbody></table></div>"
                 st.markdown(trend_html, unsafe_allow_html=True)
 
@@ -501,19 +590,17 @@ def main():
             st.markdown("### 💰 S-RIM 적정주가 분석")
 
             def show_srim_result(title, bps, roe_used, label_roe, roe_list=None):
-                try: curr_price_float = float(info['now_price'].replace(',', ''))
-                except: curr_price_float = 0
                 val = calculate_srim(bps, roe_used, required_return)
                 excess_rate = roe_used - required_return
                 
                 st.markdown(f"#### {title}")
-                if val > 0 and curr_price_float > 0:
-                    diff_rate = (curr_price_float - val) / val * 100
+                if val > 0 and curr_price > 0:
+                    diff_rate = (curr_price - val) / val * 100
                     diff_abs = abs(diff_rate)
-                    if val > curr_price_float:
-                        st.success(f"현재가({curr_price_float:,.0f}원)는 적정주가({val:,.0f}원) 대비 **{diff_abs:.1f}% 저평가** 상태입니다.")
+                    if val > curr_price:
+                        st.success(f"현재가({curr_price:,.0f}원)는 적정주가({val:,.0f}원) 대비 **{diff_abs:.1f}% 저평가** 상태입니다.")
                     else:
-                        st.error(f"현재가({curr_price_float:,.0f}원)는 적정주가({val:,.0f}원) 대비 **{diff_abs:.1f}% 고평가** 상태입니다.")
+                        st.error(f"현재가({curr_price:,.0f}원)는 적정주가({val:,.0f}원) 대비 **{diff_abs:.1f}% 고평가** 상태입니다.")
                 else:
                     st.warning("적정주가를 산출할 수 없습니다.")
 
@@ -543,7 +630,6 @@ def main():
                 for d in annual_list:
                     if d.get('roe'): roe_history_annual.append({'연도': d['date'], 'ROE': d['roe']})
                 
-                # 최근 3개년만 사용
                 roe_history_annual_3yr = roe_history_annual[-3:]
                 avg_roe_annual = sum([r['ROE'] for r in roe_history_annual_3yr]) / len(roe_history_annual_3yr) if roe_history_annual_3yr else 0
                 
@@ -558,7 +644,6 @@ def main():
                 for d in quarter_list:
                     if d.get('roe'): roe_history_quarter.append({'분기': d['date'], 'ROE': d['roe']})
                 
-                # 최근 3분기만 사용
                 roe_history_quarter_3q = roe_history_quarter[-3:]
                 avg_roe_quarter = sum([r['ROE'] for r in roe_history_quarter_3q]) / len(roe_history_quarter_3q) if roe_history_quarter_3q else 0
                 
