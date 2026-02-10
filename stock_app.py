@@ -347,81 +347,28 @@ def main():
             </div>
             """, unsafe_allow_html=True)
             
-            # --- 상세 정보 그리드 (CSS 커스텀 디자인) ---
-            # st.metric 대신 HTML/CSS Grid를 사용하여 폰트 크기 조정 및 잘림 방지
+            # --- 상세 정보 그리드 ---
             st.markdown("""
             <style>
-            .stock-info-container {
-                display: grid;
-                grid-template-columns: repeat(4, 1fr);
-                gap: 8px;
-                margin-top: 10px;
-                margin-bottom: 20px;
-            }
-            @media (max-width: 600px) {
-                .stock-info-container {
-                    grid-template-columns: repeat(2, 1fr);
-                }
-            }
-            .stock-info-box {
-                background-color: rgba(128, 128, 128, 0.1);
-                padding: 10px;
-                border-radius: 5px;
-                text-align: center;
-            }
-            .stock-info-label {
-                font-size: 12px;
-                color: #666;
-                margin-bottom: 4px;
-            }
-            .stock-info-value {
-                font-size: 15px;
-                font-weight: bold;
-                color: #333;
-                white-space: nowrap; /* 줄바꿈 방지 */
-            }
-            /* 다크모드 대응 */
-            @media (prefers-color-scheme: dark) {
-                .stock-info-label { color: #aaa; }
-                .stock-info-value { color: #fff; }
-            }
+            .stock-info-container { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 10px; margin-bottom: 20px; }
+            @media (max-width: 600px) { .stock-info-container { grid-template-columns: repeat(2, 1fr); } }
+            .stock-info-box { background-color: rgba(128, 128, 128, 0.1); padding: 10px; border-radius: 5px; text-align: center; }
+            .stock-info-label { font-size: 12px; color: #666; margin-bottom: 4px; }
+            .stock-info-value { font-size: 15px; font-weight: bold; color: #333; white-space: nowrap; }
+            @media (prefers-color-scheme: dark) { .stock-info-label { color: #aaa; } .stock-info-value { color: #fff; } }
             </style>
             """, unsafe_allow_html=True)
 
             info_html = f"""
             <div class="stock-info-container">
-                <div class="stock-info-box">
-                    <div class="stock-info-label">시가총액</div>
-                    <div class="stock-info-value">{info['market_cap']}</div>
-                </div>
-                <div class="stock-info-box">
-                    <div class="stock-info-label">외국인소진율</div>
-                    <div class="stock-info-value">{info['foreign_rate']}</div>
-                </div>
-                <div class="stock-info-box">
-                    <div class="stock-info-label">PER</div>
-                    <div class="stock-info-value">{info['per']} 배</div>
-                </div>
-                <div class="stock-info-box">
-                    <div class="stock-info-label">PBR</div>
-                    <div class="stock-info-value">{info['pbr']} 배</div>
-                </div>
-                <div class="stock-info-box">
-                    <div class="stock-info-label">52주 최고</div>
-                    <div class="stock-info-value">{info['high_52']}</div>
-                </div>
-                <div class="stock-info-box">
-                    <div class="stock-info-label">52주 최저</div>
-                    <div class="stock-info-value">{info['low_52']}</div>
-                </div>
-                <div class="stock-info-box">
-                    <div class="stock-info-label">EPS</div>
-                    <div class="stock-info-value">{info['eps']} 원</div>
-                </div>
-                <div class="stock-info-box">
-                    <div class="stock-info-label">배당수익률</div>
-                    <div class="stock-info-value">{info['dvr']} %</div>
-                </div>
+                <div class="stock-info-box"><div class="stock-info-label">시가총액</div><div class="stock-info-value">{info['market_cap']}</div></div>
+                <div class="stock-info-box"><div class="stock-info-label">외국인소진율</div><div class="stock-info-value">{info['foreign_rate']}</div></div>
+                <div class="stock-info-box"><div class="stock-info-label">PER</div><div class="stock-info-value">{info['per']} 배</div></div>
+                <div class="stock-info-box"><div class="stock-info-label">PBR</div><div class="stock-info-value">{info['pbr']} 배</div></div>
+                <div class="stock-info-box"><div class="stock-info-label">52주 최고</div><div class="stock-info-value">{info['high_52']}</div></div>
+                <div class="stock-info-box"><div class="stock-info-label">52주 최저</div><div class="stock-info-value">{info['low_52']}</div></div>
+                <div class="stock-info-box"><div class="stock-info-label">EPS</div><div class="stock-info-value">{info['eps']} 원</div></div>
+                <div class="stock-info-box"><div class="stock-info-label">배당수익률</div><div class="stock-info-value">{info['dvr']} %</div></div>
             </div>
             """
             st.markdown(info_html, unsafe_allow_html=True)
@@ -449,54 +396,47 @@ def main():
             if investor_trends:
                 st.markdown("### 🏢 외국인/기관 매매동향 (최근 10일)")
                 
-                # 데이터 프레임 생성 및 컬러링을 위한 HTML 생성
+                # HTML 생성: 들여쓰기 제거 및 중복 부호 해결
                 trend_html = """
-                <style>
-                .trend-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin-bottom: 20px; }
-                .trend-table th { background-color: rgba(128,128,128,0.1); text-align: center; padding: 6px; border-bottom: 1px solid rgba(128,128,128,0.2); }
-                .trend-table td { text-align: right; padding: 6px; border-bottom: 1px solid rgba(128,128,128,0.2); }
-                .text-red { color: #d20000; }
-                .text-blue { color: #0051c7; }
-                .text-black { color: inherit; }
-                @media (prefers-color-scheme: dark) { .text-black { color: #fff; } }
-                </style>
-                <div style="overflow-x:auto;">
-                <table class="trend-table">
-                    <thead><tr>
-                        <th>날짜</th><th>종가</th><th>등락률</th><th>기관</th><th>외국인</th>
-                    </tr></thead>
-                    <tbody>
-                """
-                
+<style>
+.trend-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin-bottom: 20px; }
+.trend-table th { background-color: rgba(128,128,128,0.1); text-align: center; padding: 6px; border-bottom: 1px solid rgba(128,128,128,0.2); }
+.trend-table td { text-align: right; padding: 6px; border-bottom: 1px solid rgba(128,128,128,0.2); }
+.text-red { color: #d20000; }
+.text-blue { color: #0051c7; }
+.text-black { color: inherit; }
+@media (prefers-color-scheme: dark) { .text-black { color: #fff; } }
+</style>
+<div style="overflow-x:auto;">
+<table class="trend-table">
+<thead><tr><th>날짜</th><th>종가</th><th>등락률</th><th>기관</th><th>외국인</th></tr></thead>
+<tbody>
+"""
                 for row in investor_trends:
-                    # 기관 색상
-                    # '+' 기호 제거 후 처리 (기존에 중복된 + 기호 제거)
+                    # 기관 색상 및 포맷팅 (중복 + 제거)
                     inst_val_str = row['기관'].replace('+', '').replace(',', '')
-                    inst_val = int(inst_val_str)
+                    try: inst_val = int(inst_val_str)
+                    except: inst_val = 0
                     inst_color = "text-red" if inst_val > 0 else "text-blue" if inst_val < 0 else "text-black"
                     inst_prefix = "+" if inst_val > 0 else ""
                     
-                    # 외국인 색상
+                    # 외국인 색상 및 포맷팅
                     frgn_val_str = row['외국인'].replace('+', '').replace(',', '')
-                    frgn_val = int(frgn_val_str)
+                    try: frgn_val = int(frgn_val_str)
+                    except: frgn_val = 0
                     frgn_color = "text-red" if frgn_val > 0 else "text-blue" if frgn_val < 0 else "text-black"
                     frgn_prefix = "+" if frgn_val > 0 else ""
                     
                     # 등락률 색상
-                    rate_val = float(row['등락률'].replace('%', ''))
+                    try: rate_val = float(row['등락률'].replace('%', ''))
+                    except: rate_val = 0.0
                     rate_color = "text-red" if rate_val > 0 else "text-blue" if rate_val < 0 else "text-black"
 
-                    trend_html += f"""
-                    <tr>
-                        <td style="text-align:center;">{row['날짜']}</td>
-                        <td>{row['종가']}</td>
-                        <td class="{rate_color}">{row['등락률']}</td>
-                        <td class="{inst_color}">{inst_prefix}{abs(inst_val):,}</td>
-                        <td class="{frgn_color}">{frgn_prefix}{abs(frgn_val):,}</td>
-                    </tr>
-                    """
+                    trend_html += f'<tr><td style="text-align:center;">{row["날짜"]}</td><td style="text-align:right;">{row["종가"]}</td><td class="{rate_color}" style="text-align:right;">{row["등락률"]}</td><td class="{inst_color}" style="text-align:right;">{inst_prefix}{abs(inst_val):,}</td><td class="{frgn_color}" style="text-align:right;">{frgn_prefix}{abs(frgn_val):,}</td></tr>'
+                
                 trend_html += "</tbody></table></div>"
                 st.markdown(trend_html, unsafe_allow_html=True)
+
             # ------------------------------------
 
             if annual:
