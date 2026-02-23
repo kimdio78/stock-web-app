@@ -161,7 +161,6 @@ def get_investor_trend(ticker):
     except:
         return []
 
-# --- 동일업종 비교 크롤링 (종목코드 제거 로직 추가) ---
 def get_same_industry_comparison(ticker):
     try:
         url = f"https://finance.naver.com/item/main.naver?code={ticker}"
@@ -178,7 +177,6 @@ def get_same_industry_comparison(ticker):
                     thead = table.select_one("thead")
                     for th in thead.select("th"):
                         if th.find("a"):
-                            # "종목명*종목코드" 형태에서 앞부분(종목명)만 추출
                             raw_header = th.text.strip()
                             clean_header = raw_header.split('*')[0].strip()
                             headers.append(clean_header)
@@ -250,9 +248,7 @@ def get_financials_from_naver(ticker, current_price=0, shares=0):
              if i < 4 and "(E)" not in col: annual_idxs.append(i)
              elif i >= 4 and "(E)" not in col: quarter_idxs.append(i)
         
-        # 수정: 연간 데이터는 최근 3개년으로 제한
         annual_idxs = annual_idxs[-3:]
-        # 분기 데이터는 최근 5분기 유지
         quarter_idxs = quarter_idxs[-5:]
 
         annual_data = [{'date': date_cols[i].split('(')[0]} for i in annual_idxs]
@@ -438,9 +434,9 @@ def main():
                     except: pass
                 
                 t_inst_color = "text-red" if total_inst > 0 else "text-blue" if total_inst < 0 else "text-black"
-                t_inst_prefix = "+" if total_inst > 0 else ""
+                t_inst_prefix = "+" if total_inst > 0 else "-" if total_inst < 0 else ""
                 t_frgn_color = "text-red" if total_frgn > 0 else "text-blue" if total_frgn < 0 else "text-black"
-                t_frgn_prefix = "+" if total_frgn > 0 else ""
+                t_frgn_prefix = "+" if total_frgn > 0 else "-" if total_frgn < 0 else ""
 
                 trend_html = """<style>
 .trend-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin-bottom: 20px; }
@@ -457,20 +453,20 @@ def main():
 <thead><tr><th>날짜</th><th>종가</th><th>등락률</th><th>기관</th><th>외국인</th><th>보유율</th></tr></thead>
 <tbody>
 """
-                trend_html += f"""<tr class="total-row"><td style="text-align:center;">10일 합계</td><td colspan="2" style="text-align:center;">-</td><td class="{t_inst_color}">{t_inst_prefix}{total_inst:,}</td><td class="{t_frgn_color}">{t_frgn_prefix}{total_frgn:,}</td><td>-</td></tr>"""
+                trend_html += f"""<tr class="total-row"><td style="text-align:center;">10일 합계</td><td colspan="2" style="text-align:center;">-</td><td class="{t_inst_color}">{t_inst_prefix}{abs(total_inst):,}</td><td class="{t_frgn_color}">{t_frgn_prefix}{abs(total_frgn):,}</td><td>-</td></tr>"""
 
                 for row in investor_trends:
                     inst_val_str = row['기관'].replace('+', '').replace(',', '')
                     try: inst_val = int(inst_val_str)
                     except: inst_val = 0
                     inst_color = "text-red" if inst_val > 0 else "text-blue" if inst_val < 0 else "text-black"
-                    inst_prefix = "+" if inst_val > 0 else ""
+                    inst_prefix = "+" if inst_val > 0 else "-" if inst_val < 0 else ""
                     
                     frgn_val_str = row['외국인'].replace('+', '').replace(',', '')
                     try: frgn_val = int(frgn_val_str)
                     except: frgn_val = 0
                     frgn_color = "text-red" if frgn_val > 0 else "text-blue" if frgn_val < 0 else "text-black"
-                    frgn_prefix = "+" if frgn_val > 0 else ""
+                    frgn_prefix = "+" if frgn_val > 0 else "-" if frgn_val < 0 else ""
                     
                     try: rate_val = float(row['등락률'].replace('%', ''))
                     except: rate_val = 0.0
@@ -481,7 +477,6 @@ def main():
                 trend_html += "</tbody></table></div>"
                 st.markdown(trend_html, unsafe_allow_html=True)
 
-            # --- CSS 스타일 (표) ---
             st.markdown("""
             <style>
             .scroll-table { overflow-x: auto; white-space: nowrap; margin-bottom: 10px; }
@@ -494,9 +489,6 @@ def main():
                 .scroll-table td { border-bottom: 1px solid #444; color: #fff; }
                 .scroll-table th:first-child, .scroll-table td:first-child { background-color: #0e1117; color: #fff; border-right: 2px solid #555; }
             }
-            .result-text { font-size: 1.1em; line-height: 1.6; color: #333333; }
-            .calc-box { background-color: #f8f9fa; border-radius: 8px; padding: 15px; margin-top: 10px; font-family: sans-serif; color: #333333; }
-            .calc-box strong { color: #000000; }
             </style>
             """, unsafe_allow_html=True)
 
@@ -544,7 +536,6 @@ def main():
             if not annual_list and not quarter_list:
                 st.warning("재무 데이터를 불러올 수 없습니다.")
 
-            # --- 동일업종 비교 ---
             if not industry_compare_df.empty:
                 st.markdown("### 👯 동일업종 비교")
                 html_compare = industry_compare_df.to_html(index=False, border=0, classes='scroll-table-content', escape=False)
@@ -587,7 +578,6 @@ def main():
                     st.markdown(f"**① 초과이익률** = {roe_used:.2f}% (ROE) - {required_return}% (요구수익률) = **{excess_rate:.2f}%**")
                     st.markdown(f"**② 적정주가** = {bps:,.0f} (BPS) + ( {bps:,.0f} × {excess_rate:.2f}% ÷ {required_return}% ) ≈ **{val:,.0f} 원**")
 
-            # 1. 최근 3년 실적 평균 기준 (연간)
             if annual_list:
                 bps_annual = annual_list[-1].get('bps', 0)
                 roe_history_annual = []
@@ -601,7 +591,6 @@ def main():
             
             st.divider()
 
-            # 2. 최근 3분기 실적 평균 기준 (분기)
             if quarter_list:
                 bps_quarter = quarter_list[-1].get('bps', 0)
                 roe_history_quarter = []
