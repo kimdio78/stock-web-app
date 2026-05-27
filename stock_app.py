@@ -106,6 +106,245 @@ def get_macro_indicators():
     return out
 
 
+# =====================================================================
+# [v3 추가] 네이버 모바일 API (JSON) + 베타/공시/업종 — 추가 크롤링 항목
+#   ① 컨센서스 목표가·투자의견  ② 영업현금흐름(CFO)
+#   ③ 베타  ④ 최근 공시  ⑤ 업종·시총순위
+#  ※ ①②는 m.stock.naver API 키 구조 미검증(빌드환경 접근차단) → 방어적 파서 +
+#    화면 하단 '디버그' 확장창에 원본 JSON을 띄워 실제 키를 확인/수정할 수 있게 함.
+# =====================================================================
+MOBILE_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) '
+                  'AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148',
+    'Referer': 'https://m.stock.naver.com/',
+}
+
+
+def _fetch_json(url):
+    try:
+        r = requests.get(url, headers=MOBILE_HEADERS, verify=False, timeout=10)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        return None
+    return None
+
+
+def _deep_find(obj, key_substrings, results=None, path="", capture_all=False):
+    """JSON을 재귀 순회하며 키에 부분문자열이 포함된 (path, value)를 수집(스칼라).
+    매칭된 키의 값이 dict/list면 그 하위 스칼라도 모두 수집(capture_all)."""
+    if results is None:
+        results = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            kl = str(k).lower()
+            matched = any(s.lower() in kl for s in key_substrings)
+            newpath = f"{path}.{k}"
+            if isinstance(v, (dict, list)):
+                _deep_find(v, key_substrings, results, newpath, capture_all or matched)
+            elif matched or capture_all:
+                results.append((newpath, v))
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj):
+            _deep_find(item, key_substrings, results, f"{path}[{i}]", capture_all)
+    return results
+
+
+def get_naver_mobile_consensus(ticker):
+    """[① §4.H 확률앵커/§7.2] 네이버 모바일 API에서 컨센서스 목표가·투자의견.
+    integration → basic 순으로 시도. 키 미검증이므로 휴리스틱 매핑 + raw 보존."""
+    out = {"target_avg": None, "target_high": None, "target_low": None,
+           "opinion": None, "raw": None, "found": []}
+    data = _fetch_json(f"https://m.stock.naver.com/api/stock/{ticker}/integration")
+    if data is None:
+        data = _fetch_json(f"https://m.stock.naver.com/api/stock/{ticker}/basic")
+    if data is None:
+        return out
+    out["raw"] = data
+    matches = _deep_find(data, ["target", "목표", "consensus", "컨센", "opinion",
+                                "투자의견", "pricetarget", "estimateprice"])
+    out["found"] = matches[:50]
+    # 경로 마지막 토큰(leaf)으로 정밀 매핑
+    def _leaf(p):
+        seg = p.rsplit(".", 1)[-1]
+        return re.sub(r'\[\d+\]', '', seg).lower()
+    for p, v in matches:
+        leaf = _leaf(p)
+        full = p.lower()
+        num = _to_num(v)
+        if num is None:
+            if out["opinion"] is None and isinstance(v, str) and \
+               any(x in str(v) for x in ["매수", "중립", "매도", "보유", "Buy", "Hold", "Sell"]):
+                out["opinion"] = v
+            continue
+        # 비현실적 값(목표가는 보통 100원 이상) 필터
+        if num < 100:
+            continue
+        if out["target_high"] is None and ("high" in leaf or "max" in leaf or "최고" in p or "upper" in leaf):
+            out["target_high"] = num
+        elif out["target_low"] is None and ("low" in leaf or "min" in leaf or "최저" in p or "lower" in leaf):
+            out["target_low"] = num
+        elif out["target_avg"] is None and (
+            leaf in ("avg", "average", "mean", "target", "value", "price",
+                     "targetprice", "consensusprice", "pricetarget")
+            or "평균" in p
+        ):
+            # target/consensus 계열 경로 아래의 값만 허용 (오인 방지)
+            if any(s in full for s in ["target", "목표", "consensus", "컨센", "pricetarget", "estimateprice"]):
+                out["target_avg"] = num
+    return out
+
+
+def _extract_finance_rows(data, title_must_include, title_must_exclude=()):
+    """모바일 재무 API JSON에서 특정 항목 행을 [{date, value}]로 방어적 추출."""
+    rowlists = []
+
+    def find_rowlists(o):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if str(k).lower() in ("rowlist", "rows", "datalist") and isinstance(v, list):
+                    rowlists.append(v)
+                find_rowlists(v)
+        elif isinstance(o, list):
+            for it in o:
+                find_rowlists(it)
+
+    find_rowlists(data)
+    for rl in rowlists:
+        for row in rl:
+            if not isinstance(row, dict):
+                continue
+            title = ""
+            for tk in ("title", "krNm", "name", "accountNm", "acctNm", "itemNm"):
+                if tk in row and isinstance(row[tk], str):
+                    title = row[tk]
+                    break
+            t_clean = title.replace(" ", "")
+            if title_must_include and title_must_include not in t_clean:
+                continue
+            if any(x in t_clean for x in title_must_exclude):
+                continue
+            res = []
+            if "columns" in row and isinstance(row["columns"], dict):
+                for date_k, cell in row["columns"].items():
+                    val = cell.get("value") if isinstance(cell, dict) else cell
+                    res.append({"date": str(date_k), "value": _to_num(val)})
+            else:
+                for k, v in row.items():
+                    if k in ("title", "krNm", "name", "accountNm", "acctNm", "itemNm"):
+                        continue
+                    if isinstance(v, (dict, list)):
+                        continue
+                    num = _to_num(v)
+                    if num is not None and re.search(r'\d{4}', str(k)):
+                        res.append({"date": str(k), "value": num})
+            if res:
+                return res
+    return []
+
+
+def get_naver_mobile_cashflow(ticker):
+    """[② §3.5/§3.7] 영업활동현금흐름(CFO) — 네이버 모바일 재무 API. 키 미검증(raw 보존)."""
+    out = {"annual": [], "quarter": [], "raw_annual": None}
+    da = _fetch_json(f"https://m.stock.naver.com/api/stock/{ticker}/finance/annual")
+    out["raw_annual"] = da
+    if da:
+        out["annual"] = _extract_finance_rows(da, "영업활동", ("투자활동", "재무활동"))
+    dq = _fetch_json(f"https://m.stock.naver.com/api/stock/{ticker}/finance/quarter")
+    if dq:
+        out["quarter"] = _extract_finance_rows(dq, "영업활동", ("투자활동", "재무활동"))
+    return out
+
+
+def get_recent_disclosures(ticker, limit=10):
+    """[④ §7.1] 최근 공시 제목·날짜 (네이버 종목 공시 탭). 상세는 DART에서 검증."""
+    try:
+        url = f"https://finance.naver.com/item/news_notice.naver?code={ticker}"
+        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, verify=False, timeout=10)
+        items = []
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.text, 'html.parser')
+            for tr in soup.select("table tr"):
+                a = tr.select_one("a")
+                tds = tr.select("td")
+                if a and tds:
+                    title = re.sub(r'\s+', ' ', a.text.strip())
+                    date = tds[-1].text.strip()
+                    if title and not title.startswith("연관기사"):
+                        items.append({"title": title, "date": date})
+                if len(items) >= limit:
+                    break
+        return items
+    except Exception:
+        return []
+
+
+def get_beta(ticker):
+    """[③ §4.A] KOSPI(KS11) 대비 약 5년 월간수익률 베타 (FinanceDataReader)."""
+    try:
+        end = datetime.now(KST).date()
+        start = end - timedelta(days=365 * 5 + 30)
+        s = fdr.DataReader(ticker, start, end)['Close'].resample('M').last()
+        m = fdr.DataReader('KS11', start, end)['Close'].resample('M').last()
+        df = pd.concat([s, m], axis=1, keys=['s', 'm']).dropna()
+        rs = df['s'].pct_change().dropna()
+        rm = df['m'].pct_change().dropna()
+        common = rs.index.intersection(rm.index)
+        rs, rm = rs.loc[common], rm.loc[common]
+        if len(rs) < 24:
+            return None
+        var = ((rm - rm.mean()) ** 2).mean()
+        if var == 0:
+            return None
+        cov = ((rs - rs.mean()) * (rm - rm.mean())).mean()
+        return float(cov / var)
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=3600)
+def load_listing_df():
+    """[⑤] 업종/시총순위 산출용 KRX 상장 목록 (컬럼 가용 시에만 사용)."""
+    try:
+        return fdr.StockListing('KRX')
+    except Exception:
+        return pd.DataFrame()
+
+
+def get_sector_and_rank(ticker, listing_df):
+    """[⑤ §3.1/§3.2/§4.G] 업종(Sector)·시장·시총순위. fdr 컬럼 가용성에 따라 best-effort."""
+    out = {"sector": None, "industry": None, "market": None, "marcap_rank": None}
+    try:
+        if listing_df is None or listing_df.empty:
+            return out
+        df = listing_df
+        code_col = 'Code' if 'Code' in df.columns else df.columns[0]
+        row = df[df[code_col] == ticker]
+        if row.empty:
+            return out
+        r0 = row.iloc[0]
+        for c in ['Sector', 'sector', '업종']:
+            if c in df.columns:
+                out["sector"] = r0.get(c)
+                break
+        for c in ['Industry', 'industry']:
+            if c in df.columns:
+                out["industry"] = r0.get(c)
+                break
+        for c in ['Market', 'market']:
+            if c in df.columns:
+                out["market"] = r0.get(c)
+                break
+        if 'Marcap' in df.columns and out["market"] and 'Market' in df.columns:
+            sub = df[df['Market'] == out["market"]].sort_values('Marcap', ascending=False).reset_index(drop=True)
+            pos = sub.index[sub[code_col] == ticker].tolist()
+            if pos:
+                out["marcap_rank"] = int(pos[0]) + 1
+    except Exception:
+        pass
+    return out
+
+
 # --- 데이터 수집 함수들 ---
 @st.cache_data(ttl=3600)
 def load_stock_data():
@@ -527,6 +766,14 @@ def main():
             liq = get_liquidity_and_band(ticker, info.get('high_52'), info.get('low_52'), curr_price)
             macro = get_macro_indicators()
 
+            # [v3 추가] ①컨센서스(네이버모바일) ②CFO ③베타 ④공시 ⑤업종·시총순위
+            listing_df = load_listing_df()
+            sector_info = get_sector_and_rank(ticker, listing_df)
+            beta = get_beta(ticker)
+            consensus = get_naver_mobile_consensus(ticker)
+            cashflow = get_naver_mobile_cashflow(ticker)
+            disclosures = get_recent_disclosures(ticker)
+
             st.markdown(f"### {info['name']} ({ticker})")
 
             # ============================================================
@@ -535,10 +782,14 @@ def main():
             adtv_txt = f"{liq['adtv']/1e8:,.1f}억원" if liq.get('adtv') else "N/A"
             usdkrw_txt = f"{macro['usdkrw']:,.1f}" if macro.get('usdkrw') else "N/A"
             kr10y_txt = f"{macro['kr10y']:.3f}%" if macro.get('kr10y') else "검색요(미수집)"
+            sector_txt = sector_info.get('sector') or sector_info.get('industry') or "N/A"
+            rank_txt = f"{sector_info['market'] or ''} {sector_info['marcap_rank']}위" if sector_info.get('marcap_rank') else "N/A"
+            beta_txt = f"{beta:.2f}" if beta is not None else "N/A"
             st.markdown(f"""
             <div class="asof-box">
             📌 <b>데이터 기준</b>: {ts['human']} · <b>{ts['session']}</b><br>
-            🔗 <b>출처</b>: 네이버 증권(시세·수급·재무·동일업종) / FinanceDataReader(거래대금·환율)<br>
+            🔗 <b>출처</b>: 네이버 증권(시세·수급·재무·동일업종·공시) / 네이버 모바일API(컨센서스·CFO) / FinanceDataReader(거래대금·환율·베타·업종)<br>
+            🏷️ <b>업종</b>: {sector_txt} · <b>시총순위</b>: {rank_txt} · <b>베타(5Y月)</b>: {beta_txt}<br>
             🌐 <b>시장지표</b>: USD/KRW {usdkrw_txt} · 국고채10Y {kr10y_txt} · 20일 ADTV {adtv_txt}
             <br><code>DATA_AS_OF={ts['iso']} SESSION={ts['session']} SRC=NAVER+FDR</code>
             </div>
@@ -748,6 +999,73 @@ def main():
                 render_fin_table("🔮 컨센서스 추정 (E)", estimate_list)
                 st.caption("출처: 네이버 증권 추정 컨센서스(E) · forward 지표(§3.5 Y+1~, §7.2)에 사용 · [Source: PDF]")
 
+            # ============================================================
+            # [v3 추가 ① §4.H 확률앵커/§7.2] 컨센서스 목표주가 (네이버 모바일 API)
+            # ============================================================
+            st.markdown("### 🎯 컨센서스 목표주가 / 투자의견")
+            c_avg = consensus.get("target_avg")
+            c_hi = consensus.get("target_high")
+            c_lo = consensus.get("target_low")
+            c_op = consensus.get("opinion")
+            if c_avg or c_hi or c_lo or c_op:
+                avg_s = f"{c_avg:,.0f}원" if c_avg else "N/A"
+                hi_s = f"{c_hi:,.0f}원" if c_hi else "N/A"
+                lo_s = f"{c_lo:,.0f}원" if c_lo else "N/A"
+                up_s = f"{(c_avg/curr_price-1)*100:+.1f}%" if (c_avg and curr_price > 0) else "N/A"
+                rng_s = f"{(c_hi/c_lo-1)*100:.0f}%" if (c_hi and c_lo and c_lo > 0) else "N/A"
+                st.markdown(f"""
+                <div class="stock-info-container" style="grid-template-columns: repeat(4, 1fr);">
+                    <div class="stock-info-box"><div class="stock-info-label">목표가 평균</div><div class="stock-info-value">{avg_s}</div></div>
+                    <div class="stock-info-box"><div class="stock-info-label">현재가 대비</div><div class="stock-info-value">{up_s}</div></div>
+                    <div class="stock-info-box"><div class="stock-info-label">목표가 최고/최저</div><div class="stock-info-value">{hi_s}/{lo_s}</div></div>
+                    <div class="stock-info-box"><div class="stock-info-label">투자의견</div><div class="stock-info-value">{c_op or 'N/A'}</div></div>
+                </div>
+                """, unsafe_allow_html=True)
+                st.caption(f"출처: 네이버 모바일 API · 목표가 분포폭(최고/최저) ≈ {rng_s} → §4.H 확률앵커 · §7.2 컨센서스 갭 · [Source: PDF]")
+            else:
+                st.info("컨센서스 목표가를 자동 추출하지 못했습니다. 아래 디버그에서 실제 JSON 키를 확인하세요.")
+            # 키 미검증 → 원본 JSON 디버그 (인쇄 시 접힌 상태라 PDF엔 미노출)
+            with st.expander("🔧 컨센서스 원본 JSON (디버그 / 키 검증용)"):
+                st.write("자동 탐색된 후보 (path, value):")
+                st.write(consensus.get("found"))
+                if consensus.get("raw") is not None:
+                    st.json(consensus["raw"], expanded=False)
+                else:
+                    st.write("응답 없음 — 엔드포인트/네트워크 확인 필요")
+
+            # ============================================================
+            # [v3 추가 ② §3.5/§3.7] 영업활동현금흐름(CFO) & 이익의 질
+            # ============================================================
+            st.markdown("### 💵 영업활동현금흐름(CFO) & 이익의 질")
+            cfo_annual = cashflow.get("annual") or []
+            if cfo_annual:
+                cfo_rows = [{"기간": r["date"], "CFO": (f"{r['value']:,.0f}" if r.get("value") is not None else "-")} for r in cfo_annual]
+                st.table(pd.DataFrame(cfo_rows))
+                # CFO/NI (이익의 질) — 최신 연간 순이익과 매칭 시도
+                try:
+                    if annual_list:
+                        last = annual_list[-1]
+                        ni = last.get("net_income", 0)
+                        ym = last.get("date", "").replace(".", "")[:6]
+                        match = None
+                        for r in cfo_annual:
+                            if ym and ym[:4] in str(r["date"]):
+                                match = r["value"]
+                        if match is not None and ni:
+                            ratio = match / ni
+                            judge = "양호(≥0.8)" if ratio >= 0.8 else ("주의(<0.5)" if ratio < 0.5 else "보통")
+                            st.markdown(f"**CFO/순이익 ≈ {ratio:.2f}** ({last['date']} 기준) → {judge}")
+                except Exception:
+                    pass
+                st.caption("출처: 네이버 모바일 재무 API · §3.7 이익의 질(CFO/NI), §3.5 영업CF · 단위 검증은 아래 디버그 참고 · [Source: PDF]")
+            else:
+                st.info("CFO를 자동 추출하지 못했습니다. 아래 디버그에서 재무 JSON 구조를 확인하세요.")
+            with st.expander("🔧 CFO 원본 JSON (디버그 / 키 검증용)"):
+                if cashflow.get("raw_annual") is not None:
+                    st.json(cashflow["raw_annual"], expanded=False)
+                else:
+                    st.write("응답 없음 — 엔드포인트/네트워크 확인 필요")
+
             if not annual_list and not quarter_list:
                 st.warning("재무 데이터를 불러올 수 없습니다.")
 
@@ -838,6 +1156,19 @@ def main():
                 avg_roe_quarter = sum([r['ROE'] for r in roe_history_quarter_3q]) / len(roe_history_quarter_3q) if roe_history_quarter_3q else 0
                 
                 show_srim_result("2. 최근 3분기 실적 평균 기준 (분기)", bps_quarter, avg_roe_quarter, "3분기 평균", roe_history_quarter_3q)
+
+            # ============================================================
+            # [v3 추가 ④ §7.1] 최근 공시 (제목·날짜) — 상세는 DART에서 검증
+            # ============================================================
+            st.divider()
+            st.markdown("### 📰 최근 공시 (네이버 종목 공시 탭)")
+            if disclosures:
+                disc_df = pd.DataFrame(disclosures)[["date", "title"]]
+                disc_df.columns = ["날짜", "제목"]
+                st.table(disc_df)
+                st.caption("출처: 네이버 증권 공시 · §7.1 조건부 판단용(자사주·CB/BW·유증·정정 등) · 상세·원문은 DART 검증 · [Source: PDF]")
+            else:
+                st.caption("최근 공시 자동 수집 결과 없음 — DART에서 직접 확인 권장")
 
         except Exception as e:
             st.error(f"오류 발생: {e}")
