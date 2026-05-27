@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import urllib3
 import FinanceDataReader as fdr
 import time
@@ -11,6 +11,100 @@ import webbrowser
 
 # SSL 경고 무시
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# [v3] 한국 표준시 — Streamlit Cloud는 UTC로 구동되므로 명시적으로 KST 변환
+KST = timezone(timedelta(hours=9))
+
+
+# =====================================================================
+# [v3 신설] 메타/보조 유틸 — 토큰 절감용 (타임스탬프, 유동성, 매크로)
+# =====================================================================
+def get_data_timestamp():
+    """크롤링(데이터 기준) 시각과 장 세션 상태를 KST로 반환.
+    Claude가 'PDF가 당일 최신인지'를 판단해 시세·수급 재검색을 생략하는 근거."""
+    now = datetime.now(KST)
+    wd = now.weekday()  # 0=월 ... 6=일
+    hm = now.hour * 100 + now.minute
+    if wd >= 5:
+        session = "휴장(주말)"
+    elif 900 <= hm <= 1530:
+        session = "장중"
+    elif hm < 900:
+        session = "장 시작 전"
+    else:
+        session = "장 마감 이후"
+    return {
+        "iso": now.strftime("%Y-%m-%dT%H:%M:%S+09:00"),
+        "human": now.strftime("%Y-%m-%d %H:%M KST"),
+        "session": session,
+    }
+
+
+def _to_num(text):
+    """'10,270' / '1.29 %' 같은 문자열 → float (실패 시 None)"""
+    if text is None:
+        return None
+    try:
+        m = re.search(r'-?\d[\d,]*\.?\d*', str(text))
+        if not m:
+            return None
+        return float(m.group().replace(',', ''))
+    except Exception:
+        return None
+
+
+def get_liquidity_and_band(ticker, high_52=None, low_52=None, curr_price=0):
+    """[v3 §8.3] 20일 평균 거래대금(ADTV), 거래량 비율, 52주 밴드 내 위치.
+    거래대금은 종가×거래량 근사(원). FinanceDataReader 사용."""
+    out = {"adtv": None, "vol_avg20": None, "vol_today": None,
+           "vol_ratio": None, "band_pos": None}
+    try:
+        end = datetime.now(KST).date()
+        start = end - timedelta(days=45)
+        df = fdr.DataReader(ticker, start, end)
+        if df is not None and not df.empty:
+            df = df.tail(20)
+            tv = (df['Close'] * df['Volume'])           # 근사 거래대금(원)
+            out["adtv"] = float(tv.mean())
+            out["vol_avg20"] = float(df['Volume'].mean())
+            out["vol_today"] = float(df['Volume'].iloc[-1])
+            if out["vol_avg20"]:
+                out["vol_ratio"] = out["vol_today"] / out["vol_avg20"]
+    except Exception:
+        pass
+    # 52주 밴드 내 위치 (추가 호출 없이 이미 크롤링한 값으로 계산)
+    try:
+        hi = _to_num(high_52)
+        lo = _to_num(low_52)
+        if hi and lo and hi > lo and curr_price > 0:
+            out["band_pos"] = (curr_price - lo) / (hi - lo) * 100
+    except Exception:
+        pass
+    return out
+
+
+def get_macro_indicators():
+    """[v3 §4.A/§5.3] USD/KRW, (best-effort) 국고채 10년물.
+    국고채 심볼은 환경에 따라 미지원일 수 있어 실패 시 None."""
+    out = {"usdkrw": None, "kr10y": None}
+    try:
+        end = datetime.now(KST).date()
+        start = end - timedelta(days=10)
+        fx = fdr.DataReader('USD/KRW', start, end)
+        if fx is not None and not fx.empty:
+            out["usdkrw"] = float(fx['Close'].iloc[-1])
+    except Exception:
+        pass
+    try:
+        end = datetime.now(KST).date()
+        start = end - timedelta(days=15)
+        bond = fdr.DataReader('KR10YT=RR', start, end)   # best-effort
+        if bond is not None and not bond.empty:
+            out["kr10y"] = float(bond['Close'].iloc[-1])
+    except Exception:
+        pass
+    return out
+
 
 # --- 데이터 수집 함수들 ---
 @st.cache_data(ttl=3600)
@@ -230,29 +324,37 @@ def clean_float(text):
         return 0.0
 
 def get_financials_from_naver(ticker, current_price=0, shares=0):
+    """[v3 개정] 연간/분기 실적 + 컨센서스 추정(E)을 함께 반환.
+    기존 버전은 '(E)' 컬럼을 버렸으나, v3 §3.5/§7.2를 위해 estimate_data로 보존."""
     try:
         url = f"https://finance.naver.com/item/main.naver?code={ticker}"
         headers = {'User-Agent': 'Mozilla/5.0'}
         response = requests.get(url, headers=headers, verify=False)
         soup = BeautifulSoup(response.text, 'html.parser')
         finance_table = soup.select_one("div.section.cop_analysis > div.sub_section > table")
-        if not finance_table: return [], []
+        if not finance_table: return [], [], []
 
         header_rows = finance_table.select("thead > tr")
         date_cols = [th.text.strip() for th in header_rows[1].select("th")]
         
         annual_idxs = []
         quarter_idxs = []
+        estimate_idxs = []   # [v3] 추정(E) 컬럼 보존
         
         for i, col in enumerate(date_cols):
-             if i < 4 and "(E)" not in col: annual_idxs.append(i)
-             elif i >= 4 and "(E)" not in col: quarter_idxs.append(i)
+             if "(E)" in col:
+                 estimate_idxs.append(i)
+             elif i < 4:
+                 annual_idxs.append(i)
+             else:
+                 quarter_idxs.append(i)
         
         annual_idxs = annual_idxs[-3:]
         quarter_idxs = quarter_idxs[-5:]
 
         annual_data = [{'date': date_cols[i].split('(')[0]} for i in annual_idxs]
         quarter_data = [{'date': date_cols[i].split('(')[0]} for i in quarter_idxs]
+        estimate_data = [{'date': date_cols[i].split('(')[0].strip()} for i in estimate_idxs]
 
         rows = finance_table.select("tbody > tr")
         items_map_main = {
@@ -290,17 +392,57 @@ def get_financials_from_naver(ticker, current_price=0, shares=0):
         
         fill_data(annual_data, annual_idxs)
         fill_data(quarter_data, quarter_idxs)
+        fill_data(estimate_data, estimate_idxs)
         
-        return annual_data, quarter_data
+        return annual_data, quarter_data, estimate_data
 
     except:
-        return [], []
+        return [], [], []
 
 def calculate_srim(bps, roe, rrr):
     if rrr <= 0: return 0
     excess_profit_rate = (roe - rrr) / 100
     fair_value = bps + (bps * excess_profit_rate / (rrr / 100))
     return fair_value
+
+
+def calculate_srim_w(bps, roe, rrr, w):
+    """[v3 §4.B] 초과이익 지속계수 w 반영 S-RIM.
+    적정주가 = BPS + BPS×(ROE-r)×w/(1+r-w).  w=1 → 영구지속(기존 식과 동일)."""
+    if rrr <= 0 or bps <= 0:
+        return 0
+    r = rrr / 100.0
+    excess = (roe - rrr) / 100.0
+    if w >= 1.0:
+        return bps + bps * excess / r
+    denom = (1 + r - w)
+    if denom <= 0:
+        return bps + bps * excess / r
+    return bps + bps * excess * w / denom
+
+
+def roe_volatility(roe_values):
+    """[v3 §4.B/§3.5] ROE 평균·표준편차·변동계수(CV) + S-RIM 신뢰도 판정."""
+    vals = [v for v in roe_values if v is not None]
+    n = len(vals)
+    if n == 0:
+        return None
+    mean = sum(vals) / n
+    if n >= 2:
+        var = sum((v - mean) ** 2 for v in vals) / (n - 1)
+        std = var ** 0.5
+    else:
+        std = 0.0
+    cv = (std / abs(mean) * 100) if mean else None
+    if cv is None:
+        grade = "판정불가"
+    elif cv <= 30:
+        grade = "안정 → S-RIM 정상 적용"
+    elif cv <= 50:
+        grade = "보통"
+    else:
+        grade = "과대 → S-RIM 참고용(신뢰구간 넓음)"
+    return {"mean": mean, "std": std, "cv": cv, "grade": grade}
 
 if 'search_key' not in st.session_state:
     st.session_state.search_key = 0 
@@ -311,6 +453,25 @@ def reset_search_state():
 # --- 메인 UI ---
 def main():
     st.set_page_config(page_title="주식 적정주가 분석기", page_icon="📈")
+
+    # [v3] 인쇄(PDF) 친화 + 넓은 표 깨짐 방지 전역 스타일
+    st.markdown("""
+    <style>
+    @media print {
+        .scroll-table { overflow: visible !important; white-space: normal !important; }
+        .scroll-table table { font-size: 0.68rem !important; table-layout: fixed; word-break: break-all; width: 100% !important; }
+        .scroll-table th, .scroll-table td { white-space: normal !important; padding: 4px !important; }
+        .scroll-table th:first-child, .scroll-table td:first-child { position: static !important; }
+        table { page-break-inside: auto; }
+        tr { page-break-inside: avoid; }
+        .asof-box { border: 1px solid #888 !important; }
+    }
+    .asof-box { background: rgba(3,199,90,0.08); border: 1px solid rgba(3,199,90,0.5);
+        border-radius: 8px; padding: 10px 14px; margin: 6px 0 14px 0; font-size: 0.9rem; }
+    .asof-box code { font-size: 0.8rem; color: #555; }
+    @media (prefers-color-scheme: dark) { .asof-box code { color: #bbb; } }
+    </style>
+    """, unsafe_allow_html=True)
     
     if 'search_list' not in st.session_state:
         with st.spinner('종목 데이터 로딩 중...'):
@@ -357,11 +518,31 @@ def main():
             try: curr_price = float(info['now_price'].replace(',', ''))
             except: curr_price = 0
             
-            annual_list, quarter_list = get_financials_from_naver(ticker, curr_price, info.get('shares', 0))
+            annual_list, quarter_list, estimate_list = get_financials_from_naver(ticker, curr_price, info.get('shares', 0))
             investor_trends = get_investor_trend(ticker)
             industry_compare_df = get_same_industry_comparison(ticker)
-            
+
+            # [v3] 보조 데이터 (토큰 절감용)
+            ts = get_data_timestamp()
+            liq = get_liquidity_and_band(ticker, info.get('high_52'), info.get('low_52'), curr_price)
+            macro = get_macro_indicators()
+
             st.markdown(f"### {info['name']} ({ticker})")
+
+            # ============================================================
+            # [v3 신설] 데이터 기준 시각 — Claude가 시세·수급 재검색 생략 판단
+            # ============================================================
+            adtv_txt = f"{liq['adtv']/1e8:,.1f}억원" if liq.get('adtv') else "N/A"
+            usdkrw_txt = f"{macro['usdkrw']:,.1f}" if macro.get('usdkrw') else "N/A"
+            kr10y_txt = f"{macro['kr10y']:.3f}%" if macro.get('kr10y') else "검색요(미수집)"
+            st.markdown(f"""
+            <div class="asof-box">
+            📌 <b>데이터 기준</b>: {ts['human']} · <b>{ts['session']}</b><br>
+            🔗 <b>출처</b>: 네이버 증권(시세·수급·재무·동일업종) / FinanceDataReader(거래대금·환율)<br>
+            🌐 <b>시장지표</b>: USD/KRW {usdkrw_txt} · 국고채10Y {kr10y_txt} · 20일 ADTV {adtv_txt}
+            <br><code>DATA_AS_OF={ts['iso']} SESSION={ts['session']} SRC=NAVER+FDR</code>
+            </div>
+            """, unsafe_allow_html=True)
             
             diff_color = "black"
             diff_arrow = ""
@@ -383,7 +564,7 @@ def main():
             
             st.markdown("""
             <style>
-            .stock-info-container { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 10px; margin-bottom: 20px; }
+            .stock-info-container { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 10px; margin-bottom: 12px; }
             @media (max-width: 600px) { .stock-info-container { grid-template-columns: repeat(2, 1fr); } }
             .stock-info-box { background-color: rgba(128, 128, 128, 0.1); padding: 10px; border-radius: 5px; text-align: center; }
             .stock-info-label { font-size: 12px; color: #666; margin-bottom: 4px; }
@@ -406,6 +587,21 @@ def main():
             """
             st.markdown(info_html, unsafe_allow_html=True)
 
+            # ============================================================
+            # [v3 신설 §8.3] 유동성·가격대 (포지션 사이징 유동성 제약용)
+            # ============================================================
+            adtv_box = f"{liq['adtv']/1e8:,.1f} 억원" if liq.get('adtv') else "N/A"
+            volr_box = f"{liq['vol_ratio']*100:,.0f} %" if liq.get('vol_ratio') else "N/A"
+            band_box = f"{liq['band_pos']:.1f} %" if liq.get('band_pos') is not None else "N/A"
+            st.markdown(f"""
+            <div class="stock-info-container" style="grid-template-columns: repeat(3, 1fr);">
+                <div class="stock-info-box"><div class="stock-info-label">20일 평균 거래대금(ADTV)</div><div class="stock-info-value">{adtv_box}</div></div>
+                <div class="stock-info-box"><div class="stock-info-label">당일 거래량(20일比)</div><div class="stock-info-value">{volr_box}</div></div>
+                <div class="stock-info-box"><div class="stock-info-label">52주 밴드 내 위치</div><div class="stock-info-value">{band_box}</div></div>
+            </div>
+            """, unsafe_allow_html=True)
+            st.caption("※ ADTV는 종가×거래량 근사치(원), 출처: FinanceDataReader. 52주 위치 0%=저점·100%=고점.")
+
             with st.expander("기업 개요 보기"):
                 st.write(info['overview'])
 
@@ -427,10 +623,20 @@ def main():
                 st.markdown("### 🏢 외국인/기관 매매동향 (최근 10일)")
                 total_inst = 0
                 total_frgn = 0
+                # [v3 §3.2] 순매수 '금액' 근사 (수량×종가) 누적 — 금액 요구 충족
+                est_inst_value = 0.0
+                est_frgn_value = 0.0
                 for row in investor_trends:
-                    try: total_inst += int(row['기관'].replace('+', '').replace(',', ''))
+                    close_v = _to_num(row.get('종가')) or 0
+                    try:
+                        iv = int(row['기관'].replace('+', '').replace(',', ''))
+                        total_inst += iv
+                        est_inst_value += iv * close_v
                     except: pass
-                    try: total_frgn += int(row['외국인'].replace('+', '').replace(',', ''))
+                    try:
+                        fv = int(row['외국인'].replace('+', '').replace(',', ''))
+                        total_frgn += fv
+                        est_frgn_value += fv * close_v
                     except: pass
                 
                 t_inst_color = "text-red" if total_inst > 0 else "text-blue" if total_inst < 0 else "text-black"
@@ -439,7 +645,7 @@ def main():
                 t_frgn_prefix = "+" if total_frgn > 0 else "-" if total_frgn < 0 else ""
 
                 trend_html = """<style>
-.trend-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin-bottom: 20px; }
+.trend-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin-bottom: 8px; }
 .trend-table th { background-color: rgba(128,128,128,0.1); text-align: center; padding: 6px; border-bottom: 1px solid rgba(128,128,128,0.2); }
 .trend-table td { text-align: right; padding: 6px; border-bottom: 1px solid rgba(128,128,128,0.2); }
 .total-row { background-color: rgba(128, 128, 128, 0.05); font-weight: bold; border-bottom: 2px solid rgba(128, 128, 128, 0.4); }
@@ -477,6 +683,14 @@ def main():
                 trend_html += "</tbody></table></div>"
                 st.markdown(trend_html, unsafe_allow_html=True)
 
+                # [v3 §3.2] 금액 근사 + 4주체 한계 명시
+                st.caption(
+                    f"※ 10일 누적 순매수 금액(근사, 수량×종가): "
+                    f"기관 ≈ {est_inst_value/1e8:,.0f}억원 · 외국인 ≈ {est_frgn_value/1e8:,.0f}억원. "
+                    f"단위: 수량=주, 금액=원 근사. "
+                    f"※ 네이버 frgn 페이지는 '기관' 합계만 제공 — 연기금 분리·개인은 미포함(필요 시 KRX 4주체 별도 수집)."
+                )
+
             st.markdown("""
             <style>
             .scroll-table { overflow-x: auto; white-space: nowrap; margin-bottom: 10px; }
@@ -492,46 +706,47 @@ def main():
             </style>
             """, unsafe_allow_html=True)
 
+            # [v3 §5.2] 배당 항목 표시 추가 (DPS·배당성향·시가배당률)
             items_display = [
                 ("매출액(억)", 'revenue'), ("영업이익(억)", 'op_income'), ("영업이익률(%)", 'op_margin'),
                 ("당기순이익(억)", 'net_income'), ("순이익률(%)", 'net_income_margin'),
                 ("부채비율(%)", 'debt_ratio'), ("당좌비율(%)", 'quick_ratio'), ("유보율(%)", 'reserve_ratio'),
                 ("EPS(원)", 'eps'), ("BPS(원)", 'bps'), ("SPS(원)", 'sps'),
                 ("PER(배)", 'per'), ("PBR(배)", 'pbr'), ("PSR(배)", 'psr'),
-                ("ROE(%)", 'roe')
+                ("ROE(%)", 'roe'),
+                ("주당배당금(원)", 'dps'), ("배당성향(%)", 'payout_ratio'), ("시가배당률(%)", 'dividend_yield'),
             ]
 
-            if annual_list:
-                st.markdown("### 📊 연간 재무제표 (최근 3년)")
-                disp_annual = []
-                cols_annual = ['항목'] + [d['date'] for d in annual_list]
+            def render_fin_table(title, data_list):
+                disp = []
+                cols = ['항목'] + [d['date'] for d in data_list]
                 for label, key in items_display:
-                    row = [label]
+                    rowv = [label]
                     is_money = '원' in label or '억' in label
-                    for d in annual_list:
+                    for d in data_list:
                         val = d.get(key, 0)
-                        if val == 0 and key not in ['op_income', 'net_income']: row.append("-")
-                        else: row.append(f"{val:,.0f}" if is_money else f"{val:,.2f}")
-                    disp_annual.append(row)
-                df_annual = pd.DataFrame(disp_annual, columns=cols_annual)
-                html_annual = df_annual.to_html(index=False, border=0, classes='scroll-table-content')
-                st.markdown(f'<div class="scroll-table">{html_annual}</div>', unsafe_allow_html=True)
+                        if val == 0 and key not in ['op_income', 'net_income']:
+                            rowv.append("-")
+                        else:
+                            rowv.append(f"{val:,.0f}" if is_money else f"{val:,.2f}")
+                    disp.append(rowv)
+                df_ = pd.DataFrame(disp, columns=cols)
+                html_ = df_.to_html(index=False, border=0, classes='scroll-table-content')
+                st.markdown(f"### {title}")
+                st.markdown(f'<div class="scroll-table">{html_}</div>', unsafe_allow_html=True)
+
+            if annual_list:
+                render_fin_table("📊 연간 재무제표 (최근 3년)", annual_list)
+                st.caption("출처: 네이버 증권 기업실적분석 · 단위: 억원/원/%/배 · [Source: PDF]")
 
             if quarter_list:
-                st.markdown("### 📊 분기 재무제표 (최근 5분기)")
-                disp_quarter = []
-                cols_quarter = ['항목'] + [d['date'] for d in quarter_list]
-                for label, key in items_display:
-                    row = [label]
-                    is_money = '원' in label or '억' in label
-                    for d in quarter_list:
-                        val = d.get(key, 0)
-                        if val == 0 and key not in ['op_income', 'net_income']: row.append("-")
-                        else: row.append(f"{val:,.0f}" if is_money else f"{val:,.2f}")
-                    disp_quarter.append(row)
-                df_quarter = pd.DataFrame(disp_quarter, columns=cols_quarter)
-                html_quarter = df_quarter.to_html(index=False, border=0, classes='scroll-table-content')
-                st.markdown(f'<div class="scroll-table">{html_quarter}</div>', unsafe_allow_html=True)
+                render_fin_table("📊 분기 재무제표 (최근 5분기)", quarter_list)
+                st.caption("출처: 네이버 증권 기업실적분석 · 단위: 억원/원/%/배 · [Source: PDF]")
+
+            # [v3 신설 §3.5/§7.2] 컨센서스 추정(E) — 기존엔 버려지던 데이터
+            if estimate_list:
+                render_fin_table("🔮 컨센서스 추정 (E)", estimate_list)
+                st.caption("출처: 네이버 증권 추정 컨센서스(E) · forward 지표(§3.5 Y+1~, §7.2)에 사용 · [Source: PDF]")
 
             if not annual_list and not quarter_list:
                 st.warning("재무 데이터를 불러올 수 없습니다.")
@@ -540,9 +755,12 @@ def main():
                 st.markdown("### 👯 동일업종 비교")
                 html_compare = industry_compare_df.to_html(index=False, border=0, classes='scroll-table-content', escape=False)
                 st.markdown(f'<div class="scroll-table">{html_compare}</div>', unsafe_allow_html=True)
+                st.caption("출처: 네이버 증권 동일업종비교 · Peer 후보군(§4.E 선정기준은 분석 단계에서 적용) · [Source: PDF]")
 
             st.divider()
             st.markdown("### 💰 S-RIM 적정주가 분석")
+            st.caption(f"요구수익률(Ke) {required_return:.1f}% 고정 적용 · [Source: PDF] "
+                       f"※ Ke는 분석 단계에서 CAPM 재산정·정합성 점검(v3 §4.A) 대상")
 
             def show_srim_result(title, bps, roe_used, label_roe, roe_list=None):
                 val = calculate_srim(bps, roe_used, required_return)
@@ -574,9 +792,28 @@ def main():
                     else:
                         st.write(f"적용 ROE: {roe_used:.2f}%")
 
+                # [v3 §4.B] ROE 변동성 진단 (S-RIM 신뢰도 판정 근거)
+                if roe_list:
+                    vol = roe_volatility([r['ROE'] for r in roe_list])
+                    if vol:
+                        cv_txt = f"{vol['cv']:.0f}%" if vol['cv'] is not None else "N/A"
+                        st.markdown(
+                            f"**📐 ROE 변동성**: 평균 {vol['mean']:.2f}% · 표준편차 {vol['std']:.2f}%p · "
+                            f"변동계수(CV) {cv_txt} → **{vol['grade']}**"
+                        )
+
+                # [v3 §4.B] 지속계수 w 시나리오 (0.0 / 0.8 / 1.0)
+                w_rows = []
+                for w in [1.0, 0.8, 0.0]:
+                    vw = calculate_srim_w(bps, roe_used, required_return, w)
+                    gap = f"{(curr_price - vw)/vw*100:+.1f}%" if vw > 0 and curr_price > 0 else "-"
+                    w_rows.append({"지속계수 w": f"{w:.1f}", "적정주가(원)": f"{vw:,.0f}", "현재가 괴리": gap})
+                st.markdown("*지속계수(w) 시나리오 — w 채택근거는 §3.3 해자 등급과 연동*")
+                st.table(pd.DataFrame(w_rows))
+
                 with st.info("계산식"):
                     st.markdown(f"**① 초과이익률** = {roe_used:.2f}% (ROE) - {required_return}% (요구수익률) = **{excess_rate:.2f}%**")
-                    st.markdown(f"**② 적정주가** = {bps:,.0f} (BPS) + ( {bps:,.0f} × {excess_rate:.2f}% ÷ {required_return}% ) ≈ **{val:,.0f} 원**")
+                    st.markdown(f"**② 적정주가(w=1)** = {bps:,.0f} (BPS) + ( {bps:,.0f} × {excess_rate:.2f}% ÷ {required_return}% ) ≈ **{val:,.0f} 원**")
 
             if annual_list:
                 bps_annual = annual_list[-1].get('bps', 0)
