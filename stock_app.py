@@ -150,48 +150,87 @@ def _deep_find(obj, key_substrings, results=None, path="", capture_all=False):
     return results
 
 
+def _recomm_label(score):
+    """[v3] FnGuide 5점 척도(5=강력매수 ~ 1=강력매도) → 한글 라벨.
+    공식 문서로 확정된 척도는 아니므로 업계 통용 해석으로 표시, 원본 점수도 병기."""
+    if score is None:
+        return None
+    s = float(score)
+    if s >= 4.5: return "강력매수"
+    if s >= 3.5: return "매수"
+    if s >= 2.5: return "중립"
+    if s >= 1.5: return "매도"
+    return "강력매도"
+
+
 def get_naver_mobile_consensus(ticker):
-    """[① §4.H 확률앵커/§7.2] 네이버 모바일 API에서 컨센서스 목표가·투자의견.
-    integration → basic 순으로 시도. 키 미검증이므로 휴리스틱 매핑 + raw 보존."""
+    """[① §4.H 확률앵커/§7.2] 네이버 모바일 API 컨센서스.
+    실제 확인된 키 구조 (디버그 패널로 검증, 005930 기준):
+      consensusInfo.priceTargetMean   = 목표가 평균
+      consensusInfo.priceTargetHigh   = 목표가 최고 (있을 때만, fallback)
+      consensusInfo.priceTargetLow    = 목표가 최저 (있을 때만, fallback)
+      consensusInfo.recommMean        = 투자의견 점수(5점 척도)
+      consensusInfo.createDate        = 컨센서스 생성일
+    """
     out = {"target_avg": None, "target_high": None, "target_low": None,
-           "opinion": None, "raw": None, "found": []}
+           "opinion": None, "opinion_score": None, "create_date": None,
+           "raw": None, "found": []}
     data = _fetch_json(f"https://m.stock.naver.com/api/stock/{ticker}/integration")
     if data is None:
         data = _fetch_json(f"https://m.stock.naver.com/api/stock/{ticker}/basic")
     if data is None:
         return out
     out["raw"] = data
-    matches = _deep_find(data, ["target", "목표", "consensus", "컨센", "opinion",
-                                "투자의견", "pricetarget", "estimateprice"])
-    out["found"] = matches[:50]
-    # 경로 마지막 토큰(leaf)으로 정밀 매핑
-    def _leaf(p):
-        seg = p.rsplit(".", 1)[-1]
-        return re.sub(r'\[\d+\]', '', seg).lower()
-    for p, v in matches:
-        leaf = _leaf(p)
-        full = p.lower()
-        num = _to_num(v)
-        if num is None:
-            if out["opinion"] is None and isinstance(v, str) and \
-               any(x in str(v) for x in ["매수", "중립", "매도", "보유", "Buy", "Hold", "Sell"]):
-                out["opinion"] = v
-            continue
-        # 비현실적 값(목표가는 보통 100원 이상) 필터
-        if num < 100:
-            continue
-        if out["target_high"] is None and ("high" in leaf or "max" in leaf or "최고" in p or "upper" in leaf):
-            out["target_high"] = num
-        elif out["target_low"] is None and ("low" in leaf or "min" in leaf or "최저" in p or "lower" in leaf):
-            out["target_low"] = num
-        elif out["target_avg"] is None and (
-            leaf in ("avg", "average", "mean", "target", "value", "price",
-                     "targetprice", "consensusprice", "pricetarget")
-            or "평균" in p
-        ):
-            # target/consensus 계열 경로 아래의 값만 허용 (오인 방지)
-            if any(s in full for s in ["target", "목표", "consensus", "컨센", "pricetarget", "estimateprice"]):
+
+    # 1) 확인된 키 직접 조회 (consensusInfo 객체 위치 탐색)
+    def _find_consensus_node(o):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if str(k).lower() == "consensusinfo" and isinstance(v, dict):
+                    return v
+                r = _find_consensus_node(v)
+                if r is not None:
+                    return r
+        elif isinstance(o, list):
+            for item in o:
+                r = _find_consensus_node(item)
+                if r is not None:
+                    return r
+        return None
+
+    cnode = _find_consensus_node(data)
+    if cnode:
+        out["target_avg"] = _to_num(cnode.get("priceTargetMean"))
+        out["target_high"] = _to_num(cnode.get("priceTargetHigh"))
+        out["target_low"] = _to_num(cnode.get("priceTargetLow"))
+        score = _to_num(cnode.get("recommMean"))
+        if score is not None:
+            out["opinion_score"] = score
+            out["opinion"] = _recomm_label(score)
+        if cnode.get("createDate"):
+            out["create_date"] = str(cnode["createDate"])
+
+    # 2) 디버그용 후보 목록 (키 변경 시 사용자가 확인 가능)
+    out["found"] = _deep_find(data, ["target", "목표", "consensus", "컨센", "opinion",
+                                     "투자의견", "recomm", "pricetarget", "estimateprice"])[:50]
+
+    # 3) Fallback: consensusInfo가 없는 경우 휴리스틱 (방어적)
+    if cnode is None:
+        for p, v in out["found"]:
+            leaf = p.rsplit(".", 1)[-1].lower()
+            num = _to_num(v)
+            if num is None:
+                continue
+            if "pricetargetmean" in leaf and out["target_avg"] is None:
                 out["target_avg"] = num
+            elif "pricetargethigh" in leaf and out["target_high"] is None:
+                out["target_high"] = num
+            elif "pricetargetlow" in leaf and out["target_low"] is None:
+                out["target_low"] = num
+            elif "recommmean" in leaf and out["opinion_score"] is None:
+                out["opinion_score"] = num
+                out["opinion"] = _recomm_label(num)
+
     return out
 
 
@@ -1007,24 +1046,40 @@ def main():
             c_hi = consensus.get("target_high")
             c_lo = consensus.get("target_low")
             c_op = consensus.get("opinion")
+            c_score = consensus.get("opinion_score")
+            c_date = consensus.get("create_date")
             if c_avg or c_hi or c_lo or c_op:
                 avg_s = f"{c_avg:,.0f}원" if c_avg else "N/A"
                 hi_s = f"{c_hi:,.0f}원" if c_hi else "N/A"
                 lo_s = f"{c_lo:,.0f}원" if c_lo else "N/A"
                 up_s = f"{(c_avg/curr_price-1)*100:+.1f}%" if (c_avg and curr_price > 0) else "N/A"
                 rng_s = f"{(c_hi/c_lo-1)*100:.0f}%" if (c_hi and c_lo and c_lo > 0) else "N/A"
+                # 투자의견: 라벨 (점수) 형태
+                if c_op and c_score is not None:
+                    op_disp = f"{c_op} ({c_score:.2f})"
+                elif c_score is not None:
+                    op_disp = f"{c_score:.2f}"
+                else:
+                    op_disp = c_op or "N/A"
+                # 목표가 최고/최저는 모바일 API에서 평균만 제공되는 경우가 잦음
+                hilo_disp = f"{hi_s}/{lo_s}" if (c_hi or c_lo) else "평균만 제공"
                 st.markdown(f"""
                 <div class="stock-info-container" style="grid-template-columns: repeat(4, 1fr);">
                     <div class="stock-info-box"><div class="stock-info-label">목표가 평균</div><div class="stock-info-value">{avg_s}</div></div>
                     <div class="stock-info-box"><div class="stock-info-label">현재가 대비</div><div class="stock-info-value">{up_s}</div></div>
-                    <div class="stock-info-box"><div class="stock-info-label">목표가 최고/최저</div><div class="stock-info-value">{hi_s}/{lo_s}</div></div>
-                    <div class="stock-info-box"><div class="stock-info-label">투자의견</div><div class="stock-info-value">{c_op or 'N/A'}</div></div>
+                    <div class="stock-info-box"><div class="stock-info-label">목표가 최고/최저</div><div class="stock-info-value">{hilo_disp}</div></div>
+                    <div class="stock-info-box"><div class="stock-info-label">투자의견(5점척도)</div><div class="stock-info-value">{op_disp}</div></div>
                 </div>
                 """, unsafe_allow_html=True)
-                st.caption(f"출처: 네이버 모바일 API · 목표가 분포폭(최고/최저) ≈ {rng_s} → §4.H 확률앵커 · §7.2 컨센서스 갭 · [Source: PDF]")
+                date_cap = f" · 컨센 기준일 {c_date}" if c_date else ""
+                anchor_cap = f"분포폭 ≈ {rng_s} → §4.H 확률앵커" if (c_hi and c_lo) else "분포폭 미수집(평균만 제공) — §4.H 확률앵커는 컨센서스 평균과 자체 추정의 갭으로 대체"
+                st.caption(
+                    f"출처: 네이버 모바일 API(consensusInfo) · {anchor_cap} · §7.2 컨센서스 갭{date_cap} · "
+                    f"투자의견 척도: 5=강력매수, 4=매수, 3=중립, 2=매도, 1=강력매도 (업계 통용) · [Source: PDF]"
+                )
             else:
                 st.info("컨센서스 목표가를 자동 추출하지 못했습니다. 아래 디버그에서 실제 JSON 키를 확인하세요.")
-            # 키 미검증 → 원본 JSON 디버그 (인쇄 시 접힌 상태라 PDF엔 미노출)
+            # 키 변경 대비 — 원본 JSON 디버그 (인쇄 시 접힌 상태라 PDF엔 미노출)
             with st.expander("🔧 컨센서스 원본 JSON (디버그 / 키 검증용)"):
                 st.write("자동 탐색된 후보 (path, value):")
                 st.write(consensus.get("found"))
