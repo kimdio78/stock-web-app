@@ -235,63 +235,194 @@ def get_naver_mobile_consensus(ticker):
 
 
 def _extract_finance_rows(data, title_must_include, title_must_exclude=()):
-    """모바일 재무 API JSON에서 특정 항목 행을 [{date, value}]로 방어적 추출."""
-    rowlists = []
+    """[v3.2 강화] JSON 트리 전체를 순회하며 title-like 키를 가진 모든 dict를 행 후보로 채집.
+    네이버 모바일 재무 API의 다양한 내부 구조(rowList/rows/dataList/trendInfo/items/...)를
+    추측 없이 한꺼번에 처리. 일치 행 → [{date, value}] 반환."""
+    title_keys = ("title", "krNm", "krName", "name", "accountNm", "acctNm",
+                  "itemNm", "acctCd", "key", "label", "code")
+    value_keys_for_cell = ("value", "amount", "val", "v", "data")
+    date_pattern = re.compile(r'^\d{4}([.\-/]\d{1,2}([.\-/]\d{1,2})?)?$')
 
-    def find_rowlists(o):
-        if isinstance(o, dict):
-            for k, v in o.items():
-                if str(k).lower() in ("rowlist", "rows", "datalist") and isinstance(v, list):
-                    rowlists.append(v)
-                find_rowlists(v)
-        elif isinstance(o, list):
+    def get_title(row):
+        for tk in title_keys:
+            v = row.get(tk)
+            if isinstance(v, str) and v.strip():
+                return v
+        return ""
+
+    def extract_values_from_row(row):
+        """행 dict에서 [{date, value}] 시계열 추출 (다양한 구조 지원)."""
+        results = []
+        # 패턴 1: columns가 {date: {value: ...}} 또는 {date: scalar}
+        for cont_k in ("columns", "values", "items", "data", "history"):
+            cont = row.get(cont_k)
+            if isinstance(cont, dict):
+                for k, v in cont.items():
+                    if isinstance(v, dict):
+                        for vk in value_keys_for_cell:
+                            if vk in v:
+                                num = _to_num(v[vk])
+                                if num is not None:
+                                    results.append({"date": str(k), "value": num})
+                                break
+                    else:
+                        num = _to_num(v)
+                        if num is not None and (date_pattern.match(str(k)) or "20" in str(k)):
+                            results.append({"date": str(k), "value": num})
+                if results:
+                    return results
+            elif isinstance(cont, list):
+                # 패턴 2: values가 [{date: ..., value: ...}, ...]
+                for item in cont:
+                    if not isinstance(item, dict):
+                        continue
+                    date_val = None
+                    for dk in ("date", "term", "period", "yyyymm", "yyyymmdd", "key"):
+                        if dk in item:
+                            date_val = str(item[dk])
+                            break
+                    num = None
+                    for vk in value_keys_for_cell:
+                        if vk in item:
+                            num = _to_num(item[vk])
+                            if num is not None:
+                                break
+                    if date_val and num is not None:
+                        results.append({"date": date_val, "value": num})
+                if results:
+                    return results
+        # 패턴 3: row 자체에 평탄하게 {연도키: 값}
+        for k, v in row.items():
+            if k in title_keys or isinstance(v, (dict, list)):
+                continue
+            ks = str(k)
+            if date_pattern.match(ks) or re.search(r'20\d{2}', ks):
+                num = _to_num(v)
+                if num is not None:
+                    results.append({"date": ks, "value": num})
+        return results
+
+    # JSON 전체에서 'dict의 list' 위치를 모두 수집 → 각 dict를 행 후보로 처리
+    candidates = []
+
+    def walk(o):
+        if isinstance(o, list):
+            if o and all(isinstance(x, dict) for x in o):
+                candidates.append(o)
             for it in o:
-                find_rowlists(it)
+                walk(it)
+        elif isinstance(o, dict):
+            for v in o.values():
+                walk(v)
 
-    find_rowlists(data)
-    for rl in rowlists:
-        for row in rl:
-            if not isinstance(row, dict):
+    walk(data)
+
+    # 후보 행들 중 title이 일치하는 첫 결과 반환
+    for rowlist in candidates:
+        for row in rowlist:
+            title = get_title(row).replace(" ", "")
+            if not title:
                 continue
-            title = ""
-            for tk in ("title", "krNm", "name", "accountNm", "acctNm", "itemNm"):
-                if tk in row and isinstance(row[tk], str):
-                    title = row[tk]
-                    break
-            t_clean = title.replace(" ", "")
-            if title_must_include and title_must_include not in t_clean:
+            if title_must_include and title_must_include not in title:
                 continue
-            if any(x in t_clean for x in title_must_exclude):
+            if any(x in title for x in title_must_exclude):
                 continue
-            res = []
-            if "columns" in row and isinstance(row["columns"], dict):
-                for date_k, cell in row["columns"].items():
-                    val = cell.get("value") if isinstance(cell, dict) else cell
-                    res.append({"date": str(date_k), "value": _to_num(val)})
-            else:
-                for k, v in row.items():
-                    if k in ("title", "krNm", "name", "accountNm", "acctNm", "itemNm"):
-                        continue
-                    if isinstance(v, (dict, list)):
-                        continue
-                    num = _to_num(v)
-                    if num is not None and re.search(r'\d{4}', str(k)):
-                        res.append({"date": str(k), "value": num})
-            if res:
-                return res
+            vals = extract_values_from_row(row)
+            if vals:
+                return vals
     return []
 
 
+def _diagnose_finance_json(data, max_titles=40):
+    """[v3.2] 추출 실패 시 디버그용 — financeInfo 내부 키/리스트 길이/타이틀 후보 요약."""
+    summary = {"top_keys": [], "list_locations": [], "title_candidates": []}
+    if not isinstance(data, dict):
+        return summary
+    summary["top_keys"] = list(data.keys())
+
+    def walk(o, path=""):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                np = f"{path}.{k}" if path else k
+                if isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
+                    summary["list_locations"].append({"path": np, "length": len(v)})
+                    # 첫 행의 키 목록과 타이틀 후보 수집
+                    sample = v[0]
+                    sample_keys = list(sample.keys())[:10]
+                    title = None
+                    for tk in ("title", "krNm", "krName", "name", "accountNm",
+                               "acctNm", "itemNm", "label"):
+                        if tk in sample and isinstance(sample[tk], str):
+                            title = sample[tk]
+                            break
+                    # 리스트 내 모든 타이틀 수집
+                    for item in v[:max_titles]:
+                        if not isinstance(item, dict):
+                            continue
+                        for tk in ("title", "krNm", "krName", "name", "accountNm",
+                                   "acctNm", "itemNm", "label"):
+                            if tk in item and isinstance(item[tk], str):
+                                summary["title_candidates"].append(
+                                    {"path": np, "key": tk, "title": item[tk]}
+                                )
+                                break
+                    summary["list_locations"][-1]["sample_keys"] = sample_keys
+                    summary["list_locations"][-1]["sample_title"] = title
+                walk(v, np)
+        elif isinstance(o, list):
+            for i, it in enumerate(o):
+                walk(it, f"{path}[{i}]")
+
+    walk(data)
+    return summary
+
+
 def get_naver_mobile_cashflow(ticker):
-    """[② §3.5/§3.7] 영업활동현금흐름(CFO) — 네이버 모바일 재무 API. 키 미검증(raw 보존)."""
-    out = {"annual": [], "quarter": [], "raw_annual": None}
-    da = _fetch_json(f"https://m.stock.naver.com/api/stock/{ticker}/finance/annual")
+    """[② §3.5/§3.7] 영업활동현금흐름(CFO) — 네이버 모바일 재무 API.
+    [v3.2] 트리 전체 순회 파서 + 진단 정보 보존. 여러 엔드포인트/표기 변형 시도."""
+    out = {"annual": [], "quarter": [], "raw_annual": None, "diag": None}
+
+    # 엔드포인트 변형 시도 (환경에 따라 경로 상이)
+    endpoints_a = [
+        f"https://m.stock.naver.com/api/stock/{ticker}/finance/annual",
+        f"https://m.stock.naver.com/api/stock/{ticker}/finance/annual/totalSum",
+        f"https://api.stock.naver.com/stock/{ticker}/finance/annual",
+    ]
+    endpoints_q = [
+        f"https://m.stock.naver.com/api/stock/{ticker}/finance/quarter",
+        f"https://m.stock.naver.com/api/stock/{ticker}/finance/quarter/totalSum",
+        f"https://api.stock.naver.com/stock/{ticker}/finance/quarter",
+    ]
+    # CFO 표기 변형 (공백 제거 후 부분일치)
+    cfo_variants = ["영업활동", "영업현금", "영업으로인한", "영업활동으로인한현금흐름", "CashFlowFromOperat"]
+    exclude = ("투자활동", "재무활동", "투자로인한", "재무로인한", "잉여", "프리")
+
+    da = None
+    for url in endpoints_a:
+        da = _fetch_json(url)
+        if da:
+            break
     out["raw_annual"] = da
     if da:
-        out["annual"] = _extract_finance_rows(da, "영업활동", ("투자활동", "재무활동"))
-    dq = _fetch_json(f"https://m.stock.naver.com/api/stock/{ticker}/finance/quarter")
+        for v in cfo_variants:
+            rows = _extract_finance_rows(da, v, exclude)
+            if rows:
+                out["annual"] = rows
+                break
+        if not out["annual"]:
+            out["diag"] = _diagnose_finance_json(da)
+
+    dq = None
+    for url in endpoints_q:
+        dq = _fetch_json(url)
+        if dq:
+            break
     if dq:
-        out["quarter"] = _extract_finance_rows(dq, "영업활동", ("투자활동", "재무활동"))
+        for v in cfo_variants:
+            rows = _extract_finance_rows(dq, v, exclude)
+            if rows:
+                out["quarter"] = rows
+                break
     return out
 
 
@@ -1116,8 +1247,15 @@ def main():
             else:
                 st.info("CFO를 자동 추출하지 못했습니다. 아래 디버그에서 재무 JSON 구조를 확인하세요.")
             with st.expander("🔧 CFO 원본 JSON (디버그 / 키 검증용)"):
+                diag = cashflow.get("diag")
+                if diag:
+                    st.markdown("**🔍 자동 진단 — 발견된 데이터 리스트 위치:**")
+                    st.write(diag.get("list_locations"))
+                    st.markdown("**🔍 발견된 항목 타이틀 후보 (여기서 '영업활동현금흐름'류 명칭 확인):**")
+                    titles = [t["title"] for t in diag.get("title_candidates", [])]
+                    st.write(titles if titles else "타이틀 후보 없음 — 아래 원본 JSON 확인")
                 if cashflow.get("raw_annual") is not None:
-                    st.json(cashflow["raw_annual"], expanded=False)
+                    st.json(cashflow["raw_annual"], expanded=True)
                 else:
                     st.write("응답 없음 — 엔드포인트/네트워크 확인 필요")
 
