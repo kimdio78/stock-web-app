@@ -15,6 +15,13 @@ import xml.etree.ElementTree as ET
 import json
 import os
 
+# 기존 코드의 import 문 아래 적당한 곳에 추가
+if 'search_key' not in st.session_state:
+    st.session_state.search_key = 0 
+
+def reset_search_state():
+    st.session_state.search_key += 1
+
 # SSL 경고 무시 (공공기관 사내망/프록시 환경 우회용)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -669,12 +676,12 @@ def main():
     
     ticker = None
     with col_search:
-        # [개선 §4] st.session_state 키 조작 대신 index=None 속성을 이용해 깔끔한 초기화 적용
         if search_list:
             stock_input = st.selectbox(
                 "종목을 선택하거나 입력하세요", 
-                options=search_list,
-                index=None,
+                [""] + search_list, # 빈 문자열을 추가하여 선택 해제 상태 구현
+                index=0,
+                key=f"stock_selectbox_{st.session_state.search_key}", # 핵심: 동적 키 할당
                 label_visibility="collapsed",
                 placeholder="종목명 또는 코드를 입력하세요..."
             )
@@ -685,6 +692,7 @@ def main():
     
     with col_reset:
         if st.button("🔄 초기화"):
+            reset_search_state() # 동적 키 값을 변경하여 위젯 강제 초기화
             st.cache_data.clear()
             st.rerun()
 
