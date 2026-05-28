@@ -460,52 +460,103 @@ def _diagnose_finance_json(data, max_titles=40):
     return summary
 
 
+def _json_has_title(data, must_include, must_exclude=()):
+    """응답 JSON 안에 특정 타이틀(부분일치)이 실제로 존재하는지 검사."""
+    found = []
+
+    def walk(o):
+        if isinstance(o, dict):
+            for tk in ("title", "krNm", "krName", "name", "accountNm", "acctNm", "itemNm", "label"):
+                v = o.get(tk)
+                if isinstance(v, str):
+                    found.append(v)
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for it in o:
+                walk(it)
+
+    walk(data)
+    for t in found:
+        tc = t.replace(" ", "")
+        if must_include in tc and not any(x in tc for x in must_exclude):
+            return True
+    return False
+
+
 def get_naver_mobile_cashflow(ticker):
-    """[② §3.5/§3.7] 영업활동현금흐름(CFO) — 네이버 모바일 재무 API.
-    [v3.2] 트리 전체 순회 파서 + 진단 정보 보존. 여러 엔드포인트/표기 변형 시도."""
-    out = {"annual": [], "quarter": [], "raw_annual": None, "diag": None}
+    """[② §3.5/§3.7] 영업활동현금흐름(CFO).
+    [v3.4] CFO는 손익/재무비율 엔드포인트(finance/annual)에 없고 현금흐름표 전용 경로에 있음.
+    여러 경로·파라미터 조합을 탐색하여 'CFO 타이틀이 실제 존재하는' 응답만 채택."""
+    out = {"annual": [], "quarter": [], "raw_annual": None, "diag": None,
+           "probe_log": [], "cfo_source_url": None}
 
-    # 엔드포인트 변형 시도 (환경에 따라 경로 상이)
-    endpoints_a = [
-        f"https://m.stock.naver.com/api/stock/{ticker}/finance/annual",
-        f"https://m.stock.naver.com/api/stock/{ticker}/finance/annual/totalSum",
-        f"https://api.stock.naver.com/stock/{ticker}/finance/annual",
+    cfo_variants = ["영업활동", "영업현금", "영업으로인한", "영업활동으로인한현금흐름"]
+    exclude = ("투자활동", "재무활동", "투자로인한", "재무로인한", "잉여", "프리", "기초", "기말")
+
+    # 현금흐름표를 담을 가능성이 있는 엔드포인트/파라미터 조합 (annual)
+    bases = [
+        "https://m.stock.naver.com/api/stock/{t}/finance/annual",
+        "https://m.stock.naver.com/api/stock/{t}/finance/annual/cashFlow",
+        "https://m.stock.naver.com/api/stock/{t}/finance/cashFlow/annual",
+        "https://m.stock.naver.com/api/stock/{t}/finance/cashflow/annual",
+        "https://api.stock.naver.com/stock/{t}/finance/annual",
     ]
-    endpoints_q = [
-        f"https://m.stock.naver.com/api/stock/{ticker}/finance/quarter",
-        f"https://m.stock.naver.com/api/stock/{ticker}/finance/quarter/totalSum",
-        f"https://api.stock.naver.com/stock/{ticker}/finance/quarter",
+    param_variants = [
+        "", "?financeType=cashFlow", "?financeType=CASHFLOW",
+        "?type=cashFlow", "?category=cashFlow", "?statementType=cashFlow",
+        "?reportType=cashFlow", "?financeCategory=cashflow",
     ]
-    # CFO 표기 변형 (공백 제거 후 부분일치)
-    cfo_variants = ["영업활동", "영업현금", "영업으로인한", "영업활동으로인한현금흐름", "CashFlowFromOperat"]
-    exclude = ("투자활동", "재무활동", "투자로인한", "재무로인한", "잉여", "프리")
 
-    da = None
-    for url in endpoints_a:
-        da = _fetch_json(url)
-        if da:
-            break
-    out["raw_annual"] = da
-    if da:
-        for v in cfo_variants:
-            rows = _extract_finance_rows(da, v, exclude)
-            if rows:
-                out["annual"] = rows
+    first_resp = None
+    for base in bases:
+        for pv in param_variants:
+            url = base.format(t=ticker) + pv
+            data = _fetch_json(url)
+            ok_resp = data is not None
+            has_cfo = bool(data) and any(_json_has_title(data, v, exclude) for v in cfo_variants)
+            out["probe_log"].append({"url": url, "resp": ok_resp, "has_CFO_title": has_cfo})
+            if ok_resp and first_resp is None:
+                first_resp = data            # 진단용 첫 응답 보존
+            if has_cfo:
+                for v in cfo_variants:
+                    rows = _extract_finance_rows(data, v, exclude)
+                    if rows:
+                        out["annual"] = rows
+                        out["cfo_source_url"] = url
+                        out["raw_annual"] = data
+                        break
+            if out["annual"]:
                 break
-        if not out["annual"]:
-            out["diag"] = _diagnose_finance_json(da)
+        if out["annual"]:
+            break
 
-    dq = None
-    for url in endpoints_q:
-        dq = _fetch_json(url)
-        if dq:
-            break
-    if dq:
-        for v in cfo_variants:
-            rows = _extract_finance_rows(dq, v, exclude)
-            if rows:
-                out["quarter"] = rows
+    # CFO를 못 찾으면 첫 응답을 진단 대상으로
+    if not out["annual"]:
+        out["raw_annual"] = first_resp
+        if first_resp is not None:
+            out["diag"] = _diagnose_finance_json(first_resp)
+
+    # quarter (annual에서 성공한 base 패턴을 우선 재사용)
+    q_bases = [b.replace("annual", "quarter") for b in bases]
+    q_params = param_variants
+    for base in q_bases:
+        done = False
+        for pv in q_params:
+            url = base.format(t=ticker) + pv
+            data = _fetch_json(url)
+            if data and any(_json_has_title(data, v, exclude) for v in cfo_variants):
+                for v in cfo_variants:
+                    rows = _extract_finance_rows(data, v, exclude)
+                    if rows:
+                        out["quarter"] = rows
+                        done = True
+                        break
+            if done:
                 break
+        if done:
+            break
+
     return out
 
 
@@ -1338,19 +1389,17 @@ def main():
             else:
                 st.info("CFO를 자동 추출하지 못했습니다. 아래 디버그에서 재무 JSON 구조를 확인하세요.")
             with st.expander("🔧 CFO 원본 JSON (디버그 / 키 검증용)"):
+                if cashflow.get("cfo_source_url"):
+                    st.success(f"CFO 데이터 출처 URL: {cashflow['cfo_source_url']}")
+                st.markdown("**🔍 엔드포인트 탐색 로그 (resp=응답있음, has_CFO_title=현금흐름 항목포함):**")
+                st.write(cashflow.get("probe_log"))
                 diag = cashflow.get("diag")
                 if diag:
-                    st.markdown("**🔍 발견된 데이터 리스트 위치:**")
-                    st.write(diag.get("list_locations"))
-                    st.markdown("**🔍 항목 타이틀 후보 (영업활동현금흐름류 명칭 확인):**")
+                    st.markdown("**🔍 (첫 응답) 항목 타이틀 후보:**")
                     titles = [t["title"] for t in diag.get("title_candidates", [])]
                     st.write(titles if titles else "타이틀 후보 없음")
-                    st.markdown("**🔍 데이터 행의 columns 구조 (날짜 키 확인용):**")
-                    st.write(diag.get("sample_columns") or "columns 구조 미발견")
-                    st.markdown("**🔍 헤더 맵 (컬럼키 → 날짜):**")
-                    st.write(diag.get("header_map") or "헤더 맵 미발견")
                 if cashflow.get("raw_annual") is not None:
-                    st.json(cashflow["raw_annual"], expanded=True)
+                    st.json(cashflow["raw_annual"], expanded=False)
                 else:
                     st.write("응답 없음 — 엔드포인트/네트워크 확인 필요")
 
