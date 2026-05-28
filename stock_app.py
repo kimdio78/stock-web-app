@@ -699,7 +699,7 @@ def main():
             industry_compare_df = get_same_industry_comparison(ticker)
             ts = get_data_timestamp()
             liq = get_liquidity_and_band(ticker, info.get('high_52'), info.get('low_52'), curr_price)
-            macro = get_macro_indicators(ecos_key)
+            macro = get_macro_indicators(ecos_api_key)
             listing_df = load_listing_df()
             sector_info = get_sector_and_rank(ticker, listing_df)
             beta = get_beta(ticker)
