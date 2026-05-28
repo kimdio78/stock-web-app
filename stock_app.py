@@ -147,10 +147,12 @@ def _kr10y_from_ecos(ecos_key):
 
 
 def get_macro_indicators(ecos_key=""):
-    """[v3 §4.A/§5.3] USD/KRW + 국고채 10년물(다중 폴백).
-    [v3.6] 국고채는 FDR→네이버→ECOS 순으로 시도해 확보율 개선."""
+    """[v3 §4.A/§5.3] USD/KRW + 국고채 10년물(다중 폴백 우선순위 변경).
+    ECOS 키가 있을 경우 한국은행 공식 데이터를 1순위로 즉시 호출.
+    장애 발생 시에만 네이버 → FDR 순으로 폴백 처리하여 안정성 확보."""
     out = {"usdkrw": None, "kr10y": None, "kr10y_src": None}
-    # USD/KRW
+    
+    # 1. USD/KRW 환율 수집
     try:
         end = datetime.now(KST).date()
         start = end - timedelta(days=10)
@@ -159,16 +161,25 @@ def get_macro_indicators(ecos_key=""):
             out["usdkrw"] = float(fx['Close'].iloc[-1])
     except Exception:
         pass
-    # 국고채 10년물 — 폴백 체인 (FDR → 네이버 → ECOS)
-    val, src = _kr10y_from_fdr()
+        
+    # 2. 국고채 10년물 — 우선순위: ECOS(1순위) → 네이버(2순위) → FDR(3순위)
+    val, src = None, None
+    
+    # 1순위: 한국은행 ECOS (인증키 보유 시 최우선 실행)
+    if ecos_key:
+        val, src = _kr10y_from_ecos(ecos_key)
+        
+    # 2순위: 네이버 시장지표 (ECOS 미입력 또는 서버 장애 시 작동)
     if val is None:
         val, src = _kr10y_from_naver()
+        
+    # 3순위: FinanceDataReader (네이버 크롤링 실패 시 최후 보루)
     if val is None:
-        val, src = _kr10y_from_ecos(ecos_key)
+        val, src = _kr10y_from_fdr()
+        
     out["kr10y"] = val
     out["kr10y_src"] = src
     return out
-
 
 # =====================================================================
 # [v3 추가] 네이버 모바일 API (JSON) + 베타/공시/업종 — 추가 크롤링 항목
