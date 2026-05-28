@@ -8,6 +8,9 @@ import FinanceDataReader as fdr
 import time
 import re
 import webbrowser
+import io
+import zipfile
+import xml.etree.ElementTree as ET
 
 # SSL 경고 무시
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -458,6 +461,108 @@ def _diagnose_finance_json(data, max_titles=40):
 
     walk(data)
     return summary
+
+
+# =====================================================================
+# [v3.5] DART 오픈API — 현금흐름표(CFO) 정식 수집
+#  네이버 모바일 API에 현금흐름표가 없어 DART로 대체. 키는 사이드바 입력.
+# =====================================================================
+@st.cache_data(ttl=86400)
+def dart_load_corpcode_map(api_key):
+    """종목코드(6자리) → DART 고유번호(8자리) 매핑. corpCode.xml(zip) 1회 다운로드 후 캐시."""
+    try:
+        url = f"https://opendart.fss.or.kr/api/corpCode.xml?crtfc_key={api_key}"
+        r = requests.get(url, timeout=20)
+        if r.status_code != 200:
+            return {}
+        zf = zipfile.ZipFile(io.BytesIO(r.content))
+        xml_name = zf.namelist()[0]
+        root = ET.fromstring(zf.read(xml_name).decode("utf-8"))
+        mapping = {}
+        for item in root.iter("list"):
+            stock_code = (item.findtext("stock_code") or "").strip()
+            corp_code = (item.findtext("corp_code") or "").strip()
+            if stock_code and corp_code and stock_code != " ":
+                mapping[stock_code] = corp_code
+        return mapping
+    except Exception:
+        return {}
+
+
+def _dart_amount(row, key):
+    """DART 금액 필드 파싱 (원 단위). 빈값/'-' 처리."""
+    v = row.get(key, "")
+    if v in ("", "-", None):
+        return None
+    return _to_num(v)
+
+
+def dart_get_cashflow(api_key, corp_code, years=3):
+    """[② §3.5/§3.7] DART fnlttSinglAcntAll에서 영업활동현금흐름(CFO) 연간 시계열.
+    최신 사업연도부터 역순으로 조회, 각 응답의 당기/전기/전전기 금액을 활용."""
+    out = {"annual": [], "source": None, "raw_sample": None, "error": None}
+    if not api_key or not corp_code:
+        out["error"] = "API 키 또는 corp_code 없음"
+        return out
+
+    this_year = datetime.now(KST).year
+    cfo_by_year = {}  # {연도(int): 금액(원)}
+    raw_sample = None
+
+    # 최근 사업연도 후보 (확정실적 지연 감안해 작년부터)
+    for by in range(this_year - 1, this_year - 1 - years - 1, -1):
+        if len([y for y in cfo_by_year if y is not None]) >= years:
+            break
+        data = None
+        for fs_div in ("CFS", "OFS"):   # 연결 우선, 없으면 별도
+            url = (f"https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
+                   f"?crtfc_key={api_key}&corp_code={corp_code}"
+                   f"&bsns_year={by}&reprt_code=11011&fs_div={fs_div}")
+            try:
+                resp = requests.get(url, timeout=15)
+                j = resp.json()
+            except Exception:
+                continue
+            if j.get("status") == "013":   # 데이터 없음
+                continue
+            if j.get("list"):
+                data = j["list"]
+                out["source"] = f"DART {fs_div} (사업보고서 11011)"
+                break
+        if not data:
+            continue
+        if raw_sample is None:
+            # CF 항목 일부를 디버그 샘플로 보존
+            raw_sample = [r for r in data if r.get("sj_div") == "CF"][:8]
+
+        # 영업활동현금흐름 행 탐색
+        for row in data:
+            if row.get("sj_div") != "CF":
+                continue
+            nm = (row.get("account_nm") or "").replace(" ", "")
+            if "영업활동" in nm and not any(x in nm for x in ("투자활동", "재무활동")):
+                # 당기/전기/전전기 = by / by-1 / by-2
+                amt_t = _dart_amount(row, "thstrm_amount")
+                amt_f = _dart_amount(row, "frmtrm_amount")
+                amt_b = _dart_amount(row, "bfefrmtrm_amount")
+                if amt_t is not None:
+                    cfo_by_year[by] = amt_t
+                if amt_f is not None:
+                    cfo_by_year.setdefault(by - 1, amt_f)
+                if amt_b is not None:
+                    cfo_by_year.setdefault(by - 2, amt_b)
+                break
+        if cfo_by_year:
+            break   # 한 해 응답에 당기/전기/전전기가 다 들어있어 보통 1회로 충분
+
+    out["raw_sample"] = raw_sample
+    # 정렬된 시계열로 변환 (억원 단위로 환산: DART는 원 단위)
+    for y in sorted(cfo_by_year.keys())[-years:]:
+        val_won = cfo_by_year[y]
+        out["annual"].append({"date": f"{y}.12", "value": val_won / 1e8})  # 억원
+    if not out["annual"] and out["error"] is None:
+        out["error"] = "CFO 행을 찾지 못함 (CF 항목 확인 필요)"
+    return out
 
 
 def _json_has_title(data, must_include, must_exclude=()):
@@ -1027,6 +1132,26 @@ def main():
     with st.sidebar:
         st.header("설정")
         required_return = st.number_input("요구수익률 (%)", 1.0, 20.0, 8.0, 0.5)
+        st.divider()
+        st.markdown("**DART 오픈API (CFO 수집용)**")
+
+        # [v3.6] Secrets 자동 인식 → 있으면 자동 사용, 없으면 수동 입력
+        secret_key = ""
+        try:
+            secret_key = st.secrets.get("DART_API_KEY", "")
+        except Exception:
+            secret_key = ""
+
+        if secret_key:
+            dart_api_key = secret_key
+            st.success("DART 인증키 자동 적용됨 (Secrets)")
+        else:
+            dart_api_key = st.text_input(
+                "DART 인증키", type="password",
+                help="opendart.fss.or.kr 에서 무료 발급. Secrets 미설정 시에만 수동 입력."
+            )
+            st.caption("키 미입력 시 CFO·이익의 질은 생략됩니다. "
+                       "자동입력을 원하면 앱 설정 → Secrets에 DART_API_KEY를 등록하세요.")
 
     st.markdown("##### 종목 검색")
     col_search, col_reset = st.columns([4, 1])
@@ -1075,7 +1200,16 @@ def main():
             sector_info = get_sector_and_rank(ticker, listing_df)
             beta = get_beta(ticker)
             consensus = get_naver_mobile_consensus(ticker)
-            cashflow = get_naver_mobile_cashflow(ticker)
+            # [v3.5] CFO는 DART 오픈API로 수집 (네이버 모바일엔 현금흐름표 없음)
+            cashflow = {"annual": [], "source": None, "error": None, "raw_sample": None}
+            if dart_api_key:
+                corp_map = dart_load_corpcode_map(dart_api_key)
+                corp_code = corp_map.get(ticker)
+                if corp_code:
+                    cashflow = dart_get_cashflow(dart_api_key, corp_code, years=3)
+                    cashflow["corp_code"] = corp_code
+                else:
+                    cashflow["error"] = "종목코드→DART 고유번호 매핑 실패 (키 확인 또는 비상장)"
             disclosures = get_recent_disclosures(ticker)
 
             st.markdown(f"### {info['name']} ({ticker})")
@@ -1354,16 +1488,17 @@ def main():
                     st.write("응답 없음 — 엔드포인트/네트워크 확인 필요")
 
             # ============================================================
-            # [v3 추가 ② §3.5/§3.7] 영업활동현금흐름(CFO) & 이익의 질
+            # [v3.5 §3.5/§3.7] 영업활동현금흐름(CFO) & 이익의 질 — DART 오픈API
             # ============================================================
             st.markdown("### 💵 영업활동현금흐름(CFO) & 이익의 질")
             cfo_annual = cashflow.get("annual") or []
             if cfo_annual:
-                cfo_rows = [{"기간": r["date"], "CFO": (f"{r['value']:,.0f}" if r.get("value") is not None else "-")} for r in cfo_annual]
+                cfo_rows = [{"기간": r["date"],
+                             "CFO(억원)": (f"{r['value']:,.0f}" if r.get("value") is not None else "-")}
+                            for r in cfo_annual]
                 st.table(pd.DataFrame(cfo_rows))
-                # CFO/NI (이익의 질) — 최신 연간 순이익과 같은 연도로 매칭
+                # CFO/NI (이익의 질) — DART CFO(억원)와 네이버 순이익(억원) 단위 일치
                 try:
-                    # 추정(E) 제외한 실제 실적 연도 우선
                     best = None
                     for d in reversed(annual_list or []):
                         yr = re.search(r'20\d{2}', str(d.get("date", "")))
@@ -1382,26 +1517,26 @@ def main():
                         ratio = cfo_v / ni
                         judge = "양호(≥0.8)" if ratio >= 0.8 else ("주의(<0.5)" if ratio < 0.5 else "보통")
                         st.markdown(f"**CFO/순이익 ≈ {ratio:.2f}** ({d_label} 기준) → {judge}")
-                        st.caption("※ CFO와 순이익 단위가 다르면(억원 vs 원) 비율이 왜곡될 수 있어 분석 시 단위 일치 확인 필요.")
                 except Exception:
                     pass
-                st.caption("출처: 네이버 모바일 재무 API · §3.7 이익의 질(CFO/NI), §3.5 영업CF · 단위 검증은 아래 디버그 참고 · [Source: PDF]")
+                src = cashflow.get("source") or "DART"
+                st.caption(f"출처: {src} · 단위 억원(원→억원 환산) · §3.7 이익의 질(CFO/NI), §3.5 영업CF · [Source: DART]")
             else:
-                st.info("CFO를 자동 추출하지 못했습니다. 아래 디버그에서 재무 JSON 구조를 확인하세요.")
-            with st.expander("🔧 CFO 원본 JSON (디버그 / 키 검증용)"):
-                if cashflow.get("cfo_source_url"):
-                    st.success(f"CFO 데이터 출처 URL: {cashflow['cfo_source_url']}")
-                st.markdown("**🔍 엔드포인트 탐색 로그 (resp=응답있음, has_CFO_title=현금흐름 항목포함):**")
-                st.write(cashflow.get("probe_log"))
-                diag = cashflow.get("diag")
-                if diag:
-                    st.markdown("**🔍 (첫 응답) 항목 타이틀 후보:**")
-                    titles = [t["title"] for t in diag.get("title_candidates", [])]
-                    st.write(titles if titles else "타이틀 후보 없음")
-                if cashflow.get("raw_annual") is not None:
-                    st.json(cashflow["raw_annual"], expanded=False)
+                err = cashflow.get("error")
+                if not dart_api_key:
+                    st.info("CFO 수집 생략 — 사이드바에 DART 인증키를 입력하면 영업활동현금흐름을 표시합니다.")
                 else:
-                    st.write("응답 없음 — 엔드포인트/네트워크 확인 필요")
+                    st.warning(f"CFO를 가져오지 못했습니다: {err or '원인 미상'}")
+            with st.expander("🔧 CFO 디버그 (DART)"):
+                st.write({
+                    "corp_code": cashflow.get("corp_code"),
+                    "source": cashflow.get("source"),
+                    "error": cashflow.get("error"),
+                })
+                if cashflow.get("raw_sample"):
+                    st.markdown("**CF 항목 샘플(원문 계정명 확인용):**")
+                    st.write([{"sj_div": r.get("sj_div"), "account_nm": r.get("account_nm"),
+                               "thstrm_amount": r.get("thstrm_amount")} for r in cashflow["raw_sample"]])
 
             if not annual_list and not quarter_list:
                 st.warning("재무 데이터를 불러올 수 없습니다.")
