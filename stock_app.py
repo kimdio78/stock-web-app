@@ -274,20 +274,38 @@ def _extract_finance_rows(data, title_must_include, title_must_exclude=(), heade
     title_keys = ("title", "krNm", "krName", "name", "accountNm", "acctNm",
                   "itemNm", "acctCd", "label")
     value_keys_for_cell = ("value", "amount", "val", "v", "data")
-    date_pattern = re.compile(r'^\d{4}([.\-/]\d{1,2}([.\-/]\d{1,2})?)?$')
+    # YYYY.MM / YYYY-MM / YYYY / YYYYMM(6) / YYYYMMDD(8) 모두 인식
+    date_pattern = re.compile(r'^(19|20)\d{2}([.\-/]?\d{2}([.\-/]?\d{2})?)?$')
 
     def looks_like_date(s):
-        s = str(s)
-        return bool(date_pattern.match(s) or re.search(r'20\d{2}', s))
+        s = str(s).strip()
+        return bool(date_pattern.match(s))
+
+    def normalize_date(s):
+        """다양한 날짜 표기를 'YYYY.MM'으로 통일. 실패 시 원본 반환."""
+        ks = str(s).strip()
+        # 구분자 없는 숫자열 (202312, 20231231, 2023)
+        digits = re.sub(r'[^\d]', '', ks)
+        if re.fullmatch(r'(19|20)\d{2}\d{2}\d{2}', digits):      # YYYYMMDD
+            return f"{digits[:4]}.{digits[4:6]}"
+        if re.fullmatch(r'(19|20)\d{2}\d{2}', digits):           # YYYYMM
+            return f"{digits[:4]}.{digits[4:6]}"
+        if re.fullmatch(r'(19|20)\d{2}', digits) and digits == ks:  # YYYY
+            return digits
+        # 이미 구분자 있는 형태 (2023.12, 2023-12-31)
+        m = re.match(r'^((19|20)\d{2})[.\-/](\d{1,2})', ks)
+        if m:
+            return f"{m.group(1)}.{int(m.group(3)):02d}"
+        return ks
 
     def resolve_date(colkey):
-        """컬럼키 → 실제 날짜. header_map 우선 조회 후, 없으면 날짜형이면 그대로."""
+        """컬럼키 → 실제 날짜 라벨. header_map 우선, 그다음 날짜 정규화."""
         ks = str(colkey)
-        if ks in header_map:          # 헤더 매핑 최우선 (예: '20231231' → '2023.12')
-            return header_map[ks]
-        if looks_like_date(ks):
-            return ks
-        return ks
+        if ks in header_map:          # 헤더 매핑 우선 (식별자 → 날짜)
+            return normalize_date(header_map[ks])
+        if looks_like_date(ks):       # 컬럼키 자체가 날짜 (202312 등)
+            return normalize_date(ks)
+        return ks                     # 못 찾으면 원본 유지
 
     def get_title(row):
         for tk in title_keys:
@@ -347,7 +365,7 @@ def _extract_finance_rows(data, title_must_include, title_must_exclude=(), heade
             if looks_like_date(k):
                 num = _to_num(v)
                 if num is not None:
-                    results.append({"date": str(k), "value": num})
+                    results.append({"date": normalize_date(k), "value": num})
         return results
 
     candidates = []
