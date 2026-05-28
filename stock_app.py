@@ -234,14 +234,60 @@ def get_naver_mobile_consensus(ticker):
     return out
 
 
-def _extract_finance_rows(data, title_must_include, title_must_exclude=()):
-    """[v3.2 강화] JSON 트리 전체를 순회하며 title-like 키를 가진 모든 dict를 행 후보로 채집.
-    네이버 모바일 재무 API의 다양한 내부 구조(rowList/rows/dataList/trendInfo/items/...)를
-    추측 없이 한꺼번에 처리. 일치 행 → [{date, value}] 반환."""
+def _build_header_map(data):
+    """[v3.3] 재무 API의 날짜 헤더 리스트(trTitleList 등)에서 {컬럼키: 날짜라벨} 맵 생성.
+    네이버 구조: rowList의 columns 키가 헤더의 key/id와 매칭됨."""
+    header_map = {}
+
+    def walk(o, path=""):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                np = f"{path}.{k}" if path else k
+                if isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
+                    if "title" in np.lower():
+                        for idx, item in enumerate(v):
+                            if not isinstance(item, dict):
+                                continue
+                            ttl = item.get("title") or item.get("name")
+                            key = item.get("key") or item.get("id") or item.get("code")
+                            if ttl is None:
+                                continue
+                            # 키가 있으면 키로, 없으면 순번(문자)으로 매핑
+                            if key is not None:
+                                header_map[str(key)] = str(ttl)
+                            header_map[str(idx)] = str(ttl)  # 순번 fallback
+                walk(v, np)
+        elif isinstance(o, list):
+            for it in o:
+                walk(it, path)
+
+    walk(data)
+    return header_map
+
+
+def _extract_finance_rows(data, title_must_include, title_must_exclude=(), header_map=None):
+    """[v3.3 강화] JSON 트리 전체를 순회하며 title-like 키를 가진 dict를 행 후보로 채집.
+    columns 키가 날짜가 아니라 컬럼식별자(c1/0/...)인 경우 header_map으로 날짜 복원."""
+    if header_map is None:
+        header_map = _build_header_map(data)
+
     title_keys = ("title", "krNm", "krName", "name", "accountNm", "acctNm",
-                  "itemNm", "acctCd", "key", "label", "code")
+                  "itemNm", "acctCd", "label")
     value_keys_for_cell = ("value", "amount", "val", "v", "data")
     date_pattern = re.compile(r'^\d{4}([.\-/]\d{1,2}([.\-/]\d{1,2})?)?$')
+
+    def looks_like_date(s):
+        s = str(s)
+        return bool(date_pattern.match(s) or re.search(r'20\d{2}', s))
+
+    def resolve_date(colkey):
+        """컬럼키 → 실제 날짜. header_map 우선 조회 후, 없으면 날짜형이면 그대로."""
+        ks = str(colkey)
+        if ks in header_map:          # 헤더 매핑 최우선 (예: '20231231' → '2023.12')
+            return header_map[ks]
+        if looks_like_date(ks):
+            return ks
+        return ks
 
     def get_title(row):
         for tk in title_keys:
@@ -251,58 +297,59 @@ def _extract_finance_rows(data, title_must_include, title_must_exclude=()):
         return ""
 
     def extract_values_from_row(row):
-        """행 dict에서 [{date, value}] 시계열 추출 (다양한 구조 지원)."""
         results = []
-        # 패턴 1: columns가 {date: {value: ...}} 또는 {date: scalar}
-        for cont_k in ("columns", "values", "items", "data", "history"):
+        for cont_k in ("columns", "values", "items", "data", "history", "cols"):
             cont = row.get(cont_k)
             if isinstance(cont, dict):
                 for k, v in cont.items():
+                    num = None
                     if isinstance(v, dict):
                         for vk in value_keys_for_cell:
                             if vk in v:
                                 num = _to_num(v[vk])
-                                if num is not None:
-                                    results.append({"date": str(k), "value": num})
                                 break
                     else:
                         num = _to_num(v)
-                        if num is not None and (date_pattern.match(str(k)) or "20" in str(k)):
-                            results.append({"date": str(k), "value": num})
+                    if num is not None:
+                        results.append({"date": resolve_date(k), "value": num})
                 if results:
                     return results
             elif isinstance(cont, list):
-                # 패턴 2: values가 [{date: ..., value: ...}, ...]
-                for item in cont:
+                # [{date,value}] 또는 [{value}] 순번 리스트
+                for idx, item in enumerate(cont):
                     if not isinstance(item, dict):
+                        # 순수 스칼라 리스트 → 순번으로 헤더 매핑
+                        num = _to_num(item)
+                        if num is not None:
+                            results.append({"date": resolve_date(idx), "value": num})
                         continue
                     date_val = None
-                    for dk in ("date", "term", "period", "yyyymm", "yyyymmdd", "key"):
+                    for dk in ("date", "term", "period", "yyyymm", "yyyymmdd", "key", "title"):
                         if dk in item:
-                            date_val = str(item[dk])
+                            date_val = resolve_date(item[dk])
                             break
+                    if date_val is None:
+                        date_val = resolve_date(idx)
                     num = None
                     for vk in value_keys_for_cell:
                         if vk in item:
                             num = _to_num(item[vk])
                             if num is not None:
                                 break
-                    if date_val and num is not None:
+                    if num is not None:
                         results.append({"date": date_val, "value": num})
                 if results:
                     return results
-        # 패턴 3: row 자체에 평탄하게 {연도키: 값}
+        # 평탄 {연도:값}
         for k, v in row.items():
             if k in title_keys or isinstance(v, (dict, list)):
                 continue
-            ks = str(k)
-            if date_pattern.match(ks) or re.search(r'20\d{2}', ks):
+            if looks_like_date(k):
                 num = _to_num(v)
                 if num is not None:
-                    results.append({"date": ks, "value": num})
+                    results.append({"date": str(k), "value": num})
         return results
 
-    # JSON 전체에서 'dict의 list' 위치를 모두 수집 → 각 dict를 행 후보로 처리
     candidates = []
 
     def walk(o):
@@ -317,7 +364,6 @@ def _extract_finance_rows(data, title_must_include, title_must_exclude=()):
 
     walk(data)
 
-    # 후보 행들 중 title이 일치하는 첫 결과 반환
     for rowlist in candidates:
         for row in rowlist:
             title = get_title(row).replace(" ", "")
@@ -334,8 +380,10 @@ def _extract_finance_rows(data, title_must_include, title_must_exclude=()):
 
 
 def _diagnose_finance_json(data, max_titles=40):
-    """[v3.2] 추출 실패 시 디버그용 — financeInfo 내부 키/리스트 길이/타이틀 후보 요약."""
-    summary = {"top_keys": [], "list_locations": [], "title_candidates": []}
+    """[v3.2] 추출 실패 시 디버그용 — financeInfo 내부 키/리스트 길이/타이틀 후보 요약.
+    [v3.3] columns 내부 구조와 헤더(trTitleList) 매핑까지 노출."""
+    summary = {"top_keys": [], "list_locations": [], "title_candidates": [],
+               "sample_columns": None, "header_map": None}
     if not isinstance(data, dict):
         return summary
     summary["top_keys"] = list(data.keys())
@@ -346,7 +394,6 @@ def _diagnose_finance_json(data, max_titles=40):
                 np = f"{path}.{k}" if path else k
                 if isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
                     summary["list_locations"].append({"path": np, "length": len(v)})
-                    # 첫 행의 키 목록과 타이틀 후보 수집
                     sample = v[0]
                     sample_keys = list(sample.keys())[:10]
                     title = None
@@ -355,7 +402,6 @@ def _diagnose_finance_json(data, max_titles=40):
                         if tk in sample and isinstance(sample[tk], str):
                             title = sample[tk]
                             break
-                    # 리스트 내 모든 타이틀 수집
                     for item in v[:max_titles]:
                         if not isinstance(item, dict):
                             continue
@@ -368,6 +414,25 @@ def _diagnose_finance_json(data, max_titles=40):
                                 break
                     summary["list_locations"][-1]["sample_keys"] = sample_keys
                     summary["list_locations"][-1]["sample_title"] = title
+                    # [v3.3] 데이터 행으로 보이는 리스트의 columns 구조 1개 노출
+                    if "columns" in sample and summary["sample_columns"] is None:
+                        col = sample["columns"]
+                        if isinstance(col, dict):
+                            preview = {}
+                            for ck, cv in list(col.items())[:6]:
+                                preview[ck] = cv
+                            summary["sample_columns"] = {"path": np, "preview": preview}
+                    # [v3.3] 헤더 리스트(날짜 매핑) 추출: key→title
+                    if "Title" in np or "title" in np.lower():
+                        hm = {}
+                        for item in v:
+                            if isinstance(item, dict):
+                                key = item.get("key") or item.get("id") or item.get("code")
+                                ttl = item.get("title") or item.get("name")
+                                if key is not None and ttl is not None:
+                                    hm[str(key)] = str(ttl)
+                        if hm:
+                            summary["header_map"] = {"path": np, "map": hm}
                 walk(v, np)
         elif isinstance(o, list):
             for i, it in enumerate(o):
@@ -1227,20 +1292,28 @@ def main():
             if cfo_annual:
                 cfo_rows = [{"기간": r["date"], "CFO": (f"{r['value']:,.0f}" if r.get("value") is not None else "-")} for r in cfo_annual]
                 st.table(pd.DataFrame(cfo_rows))
-                # CFO/NI (이익의 질) — 최신 연간 순이익과 매칭 시도
+                # CFO/NI (이익의 질) — 최신 연간 순이익과 같은 연도로 매칭
                 try:
-                    if annual_list:
-                        last = annual_list[-1]
-                        ni = last.get("net_income", 0)
-                        ym = last.get("date", "").replace(".", "")[:6]
-                        match = None
-                        for r in cfo_annual:
-                            if ym and ym[:4] in str(r["date"]):
-                                match = r["value"]
-                        if match is not None and ni:
-                            ratio = match / ni
-                            judge = "양호(≥0.8)" if ratio >= 0.8 else ("주의(<0.5)" if ratio < 0.5 else "보통")
-                            st.markdown(f"**CFO/순이익 ≈ {ratio:.2f}** ({last['date']} 기준) → {judge}")
+                    # 추정(E) 제외한 실제 실적 연도 우선
+                    best = None
+                    for d in reversed(annual_list or []):
+                        yr = re.search(r'20\d{2}', str(d.get("date", "")))
+                        ni = d.get("net_income", 0)
+                        if yr and ni:
+                            cfo_v = None
+                            for r in cfo_annual:
+                                if yr.group() in str(r["date"]):
+                                    cfo_v = r["value"]
+                                    break
+                            if cfo_v is not None:
+                                best = (d["date"], cfo_v, ni)
+                                break
+                    if best:
+                        d_label, cfo_v, ni = best
+                        ratio = cfo_v / ni
+                        judge = "양호(≥0.8)" if ratio >= 0.8 else ("주의(<0.5)" if ratio < 0.5 else "보통")
+                        st.markdown(f"**CFO/순이익 ≈ {ratio:.2f}** ({d_label} 기준) → {judge}")
+                        st.caption("※ CFO와 순이익 단위가 다르면(억원 vs 원) 비율이 왜곡될 수 있어 분석 시 단위 일치 확인 필요.")
                 except Exception:
                     pass
                 st.caption("출처: 네이버 모바일 재무 API · §3.7 이익의 질(CFO/NI), §3.5 영업CF · 단위 검증은 아래 디버그 참고 · [Source: PDF]")
@@ -1249,11 +1322,15 @@ def main():
             with st.expander("🔧 CFO 원본 JSON (디버그 / 키 검증용)"):
                 diag = cashflow.get("diag")
                 if diag:
-                    st.markdown("**🔍 자동 진단 — 발견된 데이터 리스트 위치:**")
+                    st.markdown("**🔍 발견된 데이터 리스트 위치:**")
                     st.write(diag.get("list_locations"))
-                    st.markdown("**🔍 발견된 항목 타이틀 후보 (여기서 '영업활동현금흐름'류 명칭 확인):**")
+                    st.markdown("**🔍 항목 타이틀 후보 (영업활동현금흐름류 명칭 확인):**")
                     titles = [t["title"] for t in diag.get("title_candidates", [])]
-                    st.write(titles if titles else "타이틀 후보 없음 — 아래 원본 JSON 확인")
+                    st.write(titles if titles else "타이틀 후보 없음")
+                    st.markdown("**🔍 데이터 행의 columns 구조 (날짜 키 확인용):**")
+                    st.write(diag.get("sample_columns") or "columns 구조 미발견")
+                    st.markdown("**🔍 헤더 맵 (컬럼키 → 날짜):**")
+                    st.write(diag.get("header_map") or "헤더 맵 미발견")
                 if cashflow.get("raw_annual") is not None:
                     st.json(cashflow["raw_annual"], expanded=True)
                 else:
