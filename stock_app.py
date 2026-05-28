@@ -565,6 +565,123 @@ def dart_get_cashflow(api_key, corp_code, years=3):
     return out
 
 
+def _dart_fetch_report(api_key, endpoint, corp_code, prefer_years=2):
+    """[v3.6] DART 정기보고서 주요정보 공통 호출. 최근 사업연도부터 시도, list 반환."""
+    this_year = datetime.now(KST).year
+    for by in range(this_year - 1, this_year - 1 - prefer_years - 1, -1):
+        url = (f"https://opendart.fss.or.kr/api/{endpoint}.json"
+               f"?crtfc_key={api_key}&corp_code={corp_code}"
+               f"&bsns_year={by}&reprt_code=11011")
+        try:
+            j = requests.get(url, timeout=15).json()
+        except Exception:
+            continue
+        if j.get("status") == "013":
+            continue
+        if j.get("list"):
+            return j["list"], by
+    return [], None
+
+
+def dart_get_shareholders(api_key, corp_code):
+    """[① §5.1] 최대주주현황 — 오너 일가 지분율·특수관계인 합계."""
+    out = {"top": None, "rows": [], "total_rate": None, "year": None, "error": None, "raw": None}
+    if not api_key or not corp_code:
+        out["error"] = "키/코드 없음"
+        return out
+    rows, by = _dart_fetch_report(api_key, "hyslrSttus", corp_code)
+    out["year"] = by
+    out["raw"] = rows[:10]
+    if not rows:
+        out["error"] = "최대주주 데이터 없음"
+        return out
+    parsed = []
+    for r in rows:
+        nm = r.get("nm")
+        rate = _to_num(r.get("trmend_posesn_stock_qota_rt")) or _to_num(r.get("bsis_posesn_stock_qota_rt"))
+        relate = r.get("relate")
+        if nm and rate is not None:
+            parsed.append({"이름": nm, "관계": relate or "-", "지분율": rate})
+    # '계' 행이 특수관계인 합계 (관계가 '계'/'소계'/None인 큰 값)
+    total = None
+    for r in parsed:
+        if r["이름"] and any(x in str(r["이름"]) for x in ("계", "합계")):
+            total = r["지분율"]
+    if total is None and parsed:
+        # 합계행이 없으면 개별 지분율 합산 근사
+        total = sum(p["지분율"] for p in parsed if not any(x in str(p["이름"]) for x in ("계", "합계")))
+    # 최대주주(최상위 개별)
+    indiv = [p for p in parsed if not any(x in str(p["이름"]) for x in ("계", "합계"))]
+    if indiv:
+        out["top"] = max(indiv, key=lambda x: x["지분율"])
+    out["rows"] = parsed[:8]
+    out["total_rate"] = total
+    return out
+
+
+def dart_get_dividend(api_key, corp_code):
+    """[② §5.2] 배당에 관한 사항 — 주당배당금·배당성향·배당수익률 (당기/전기/전전기)."""
+    out = {"items": {}, "year": None, "error": None, "raw": None}
+    if not api_key or not corp_code:
+        out["error"] = "키/코드 없음"
+        return out
+    rows, by = _dart_fetch_report(api_key, "alotMatter", corp_code)
+    out["year"] = by
+    out["raw"] = rows[:20]
+    if not rows:
+        out["error"] = "배당 데이터 없음"
+        return out
+    # se(항목명)별로 당기/전기/전전기 값 매핑
+    wanted = {
+        "주당 현금배당금": "DPS", "주당현금배당금": "DPS",
+        "현금배당성향": "배당성향", "배당성향": "배당성향",
+        "현금배당수익률": "배당수익률", "배당수익률": "배당수익률",
+    }
+    for r in rows:
+        se = (r.get("se") or "").replace(" ", "")
+        for k, label in wanted.items():
+            if k.replace(" ", "") in se:
+                vals = {
+                    "당기": _to_num(r.get("thstrm")),
+                    "전기": _to_num(r.get("frmtrm")),
+                    "전전기": _to_num(r.get("lwfr")),
+                }
+                # 보통주 기준 행 우선 (우선주 행 중복 시 첫 유효값 유지)
+                if label not in out["items"] or all(v is None for v in out["items"][label].values()):
+                    out["items"][label] = vals
+                break
+    if not out["items"]:
+        out["error"] = "배당 항목 파싱 실패 (raw 확인)"
+    return out
+
+
+def dart_get_treasury(api_key, corp_code):
+    """[③ §5.2] 자기주식 취득·처분·보유 현황 (보유 수량 중심)."""
+    out = {"hold": None, "rows": [], "year": None, "error": None, "raw": None}
+    if not api_key or not corp_code:
+        out["error"] = "키/코드 없음"
+        return out
+    rows, by = _dart_fetch_report(api_key, "tesstkAcqsDspsSttus", corp_code)
+    out["year"] = by
+    out["raw"] = rows[:15]
+    if not rows:
+        out["error"] = "자기주식 데이터 없음 (보유 없음일 수 있음)"
+        return out
+    # 보유 잔량 행 탐색 (se/acqs_mth 등에 '보유' 또는 기말잔고)
+    for r in rows:
+        label = " ".join(str(r.get(k, "")) for k in ("acqs_mth1", "acqs_mth2", "acqs_mth3", "se"))
+        qty = _to_num(r.get("trmend_qy")) or _to_num(r.get("hold_qy"))
+        if qty is not None:
+            out["rows"].append({"구분": label.strip() or "-", "수량": qty})
+    # 합계/보유 행
+    for r in out["rows"]:
+        if any(x in r["구분"] for x in ("보유", "총계", "합계", "계")):
+            out["hold"] = r["수량"]
+    if out["hold"] is None and out["rows"]:
+        out["hold"] = out["rows"][-1]["수량"]
+    return out
+
+
 def _json_has_title(data, must_include, must_exclude=()):
     """응답 JSON 안에 특정 타이틀(부분일치)이 실제로 존재하는지 검사."""
     found = []
@@ -1202,12 +1319,18 @@ def main():
             consensus = get_naver_mobile_consensus(ticker)
             # [v3.5] CFO는 DART 오픈API로 수집 (네이버 모바일엔 현금흐름표 없음)
             cashflow = {"annual": [], "source": None, "error": None, "raw_sample": None}
+            dart_gov = {"top": None, "rows": [], "total_rate": None, "error": "키 없음"}
+            dart_div = {"items": {}, "error": "키 없음"}
+            dart_tres = {"hold": None, "rows": [], "error": "키 없음"}
             if dart_api_key:
                 corp_map = dart_load_corpcode_map(dart_api_key)
                 corp_code = corp_map.get(ticker)
                 if corp_code:
                     cashflow = dart_get_cashflow(dart_api_key, corp_code, years=3)
                     cashflow["corp_code"] = corp_code
+                    dart_gov = dart_get_shareholders(dart_api_key, corp_code)
+                    dart_div = dart_get_dividend(dart_api_key, corp_code)
+                    dart_tres = dart_get_treasury(dart_api_key, corp_code)
                 else:
                     cashflow["error"] = "종목코드→DART 고유번호 매핑 실패 (키 확인 또는 비상장)"
             disclosures = get_recent_disclosures(ticker)
@@ -1537,6 +1660,66 @@ def main():
                     st.markdown("**CF 항목 샘플(원문 계정명 확인용):**")
                     st.write([{"sj_div": r.get("sj_div"), "account_nm": r.get("account_nm"),
                                "thstrm_amount": r.get("thstrm_amount")} for r in cashflow["raw_sample"]])
+
+            # ============================================================
+            # [v3.6 §5.1/§5.2] 한국시장 특수요인 — DART 정식 데이터
+            # ============================================================
+            if dart_api_key:
+                st.markdown("### 🇰🇷 지배구조·밸류업 (DART)")
+                col_g, col_d = st.columns(2)
+
+                # ① 지배구조 — 최대주주 지분율 (§5.1)
+                with col_g:
+                    st.markdown("**최대주주 현황 (§5.1)**")
+                    if dart_gov.get("top"):
+                        top = dart_gov["top"]
+                        st.markdown(f"최대주주: **{top['이름']}** ({top['관계']}) {top['지분율']:.2f}%")
+                    if dart_gov.get("total_rate") is not None:
+                        st.markdown(f"특수관계인 합계: **{dart_gov['total_rate']:.2f}%**")
+                    if dart_gov.get("rows"):
+                        gov_df = pd.DataFrame(dart_gov["rows"])
+                        gov_df["지분율"] = gov_df["지분율"].apply(lambda x: f"{x:.2f}%")
+                        st.table(gov_df)
+                    if dart_gov.get("error"):
+                        st.caption(f"※ {dart_gov['error']}")
+                    yr = dart_gov.get("year")
+                    st.caption(f"출처: DART 최대주주현황 ({yr} 사업보고서) · [Source: DART]")
+
+                # ② 밸류업 — 배당 (§5.2)
+                with col_d:
+                    st.markdown("**배당 추이 (§5.2)**")
+                    items = dart_div.get("items") or {}
+                    if items:
+                        order = ["당기", "전기", "전전기"]
+                        div_rows = []
+                        for label, vals in items.items():
+                            row = {"항목": label}
+                            for t in order:
+                                v = vals.get(t)
+                                row[t] = (f"{v:,.0f}" if (v is not None and label == "DPS")
+                                          else (f"{v:.2f}" if v is not None else "-"))
+                            div_rows.append(row)
+                        st.table(pd.DataFrame(div_rows))
+                    if dart_div.get("error"):
+                        st.caption(f"※ {dart_div['error']}")
+                    st.caption(f"출처: DART 배당에관한사항 ({dart_div.get('year')}) · DPS 원, 성향·수익률 % · [Source: DART]")
+
+                # ③ 밸류업 — 자기주식 (§5.2)
+                st.markdown("**자기주식 현황 (§5.2)**")
+                if dart_tres.get("hold") is not None:
+                    st.markdown(f"보유 자기주식: **{dart_tres['hold']:,.0f}주**")
+                if dart_tres.get("rows"):
+                    with st.expander("자기주식 세부 내역"):
+                        st.table(pd.DataFrame(dart_tres["rows"]))
+                if dart_tres.get("error"):
+                    st.caption(f"※ {dart_tres['error']}")
+                st.caption(f"출처: DART 자기주식 취득·처분현황 ({dart_tres.get('year')}) · [Source: DART]")
+
+                # 파싱 실패 대비 디버그
+                with st.expander("🔧 지배구조·배당·자사주 원본 (디버그)"):
+                    st.markdown("**최대주주 raw:**"); st.write(dart_gov.get("raw"))
+                    st.markdown("**배당 raw:**"); st.write(dart_div.get("raw"))
+                    st.markdown("**자기주식 raw:**"); st.write(dart_tres.get("raw"))
 
             if not annual_list and not quarter_list:
                 st.warning("재무 데이터를 불러올 수 없습니다.")
